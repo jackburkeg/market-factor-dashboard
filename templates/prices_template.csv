@@ -1,0 +1,4 @@
+symbol,session_date,adjusted_close,close,dividend,split_ratio,close_basis,currency,exchange,source
+EXAMPLE.TO,2024-01-02,40.12,41.50,0,1,split_adjusted,CAD,TSX,my_vendor_export
+EXAMPLE.TO,2024-01-03,40.55,41.95,0,1,split_adjusted,CAD,TSX,my_vendor_export
+EXAMPLE.TO,2024-01-04,40.80,41.81,0.39,1,split_adjusted,CAD,TSX,my_vendor_export

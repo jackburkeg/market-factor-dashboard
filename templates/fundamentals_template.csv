@@ -1,0 +1,6 @@
+symbol,fiscal_period_end,period_type,available_at,metric,value,currency,unit,source,revision
+EXAMPLE.TO,2023-12-31,Q,2024-02-29T07:00:00-05:00,interest_bearing_debt,10500000000,CAD,CAD,company press release,1
+EXAMPLE.TO,2023-12-31,Q,2024-02-29T07:00:00-05:00,lease_liabilities,700000000,CAD,CAD,company press release,1
+EXAMPLE.TO,2023-12-31,Q,2024-02-29T07:00:00-05:00,total_assets,75000000000,CAD,CAD,company press release,1
+EXAMPLE.TO,2023-12-31,Q,2024-02-29T07:00:00-05:00,net_income,1800000000,CAD,CAD,company press release,1
+EXAMPLE.TO,2023-12-31,Q,2024-08-08T07:00:00-04:00,interest_bearing_debt,10650000000,CAD,CAD,restated in Q2 2024 filing,2
