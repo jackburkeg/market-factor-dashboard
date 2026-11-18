@@ -23,6 +23,36 @@ The app opens at http://localhost:8501. Run the tests with `pytest`.
 
 The tested environment was Python 3.13 with pandas 3.0.5, numpy 2.5.3, scipy 1.18.1, statsmodels 0.15.0, scikit-learn 1.9.1, PyPortfolioOpt 1.6.0 (cvxpy 1.9.3), Streamlit 1.67.0, Plotly 7.1.0, pyarrow 26.0.1 and yfinance 1.8.0. `requirements.lock` pins the full dependency tree. That tree was resolved on a Linux build host, so if one transitive pin has no macOS wheel, use the `pip install -e .` route. It uses the compatible ranges in `pyproject.toml`.
 
+## Use it on the web (Streamlit Community Cloud, free)
+
+1. Go to **share.streamlit.io** and sign in with GitHub.
+2. Click **Create app** → *Deploy a public app from GitHub*.
+3. Repository `jackburkeg/market-factor-dashboard`, branch `main`, main file `app.py`.
+4. Under **Advanced settings**, choose Python 3.12 or 3.13. Optionally add `FRED_API_KEY` under *Secrets*
+   as `FRED_API_KEY = "..."`. Click **Deploy**.
+
+Community Cloud installs `requirements.txt`, gives you a web address, and redeploys automatically each time
+the repo's `main` branch changes. The free tier allows one private app (app privacy can be set separately
+from repo privacy in the app's *Sharing* settings). Apps sleep after a period without visitors and wake on
+the next visit. Yahoo may rate-limit requests from shared cloud servers; the demo and CSV modes are unaffected.
+
+Nothing in the app refreshes on a timer. Data downloads happen when the app loads (and are cached) or when
+you press a refresh button.
+
+## Tabs
+
+| Tab | What it shows |
+|---|---|
+| Start here | Plain-language key findings, how to use the app, glossary |
+| Latest month | Each stock's latest completed-month return split into market / oil / rate / FX contributions and a stock-specific remainder. In Live mode, a **Refresh latest quotes** button adds month-to-date moves (cached 15 minutes). |
+| Data | Universe, coverage, missing data, excluded rows, definitions |
+| What moves each stock | Per-stock sensitivities with uncertainty and diagnostics |
+| Oil × debt | Interaction analysis and scenarios |
+| Stability over time | Rolling-window estimates |
+| Can it predict? | Out-of-sample forecast test against simple baselines |
+| Portfolio | Minimum-volatility vs equal-weight, with a costed backtest |
+| Export | CSV/JSON exports and a reproducible bundle |
+
 ## Data modes (sidebar)
 
 | Mode | What it does |
@@ -71,7 +101,7 @@ All are TSX listings quoted in CAD. At run time the app compares the provider's 
 
 ## Verification status of this build
 
-- **Exercised:** all five core analyses plus the portfolio module on the synthetic dataset, through the running app in a headless browser. The run-bundle export → CSV import → identical results round trip. The live-provider failure path: no network was available in the build environment, and the app showed a source-specific error per symbol and pointed to CSV import. `pytest`: 47 tests covering return shifts, month boundaries, incomplete months, release-time joins and restatements, dividend/split handling, missing and constant features, recovery of a known interaction with an exact check of the covariance-based slope SE, look-ahead invariance, matched-date metrics with negative OOS R², and portfolio feasibility, weights, monthly annualization, drift, execution timing, costs and delisting.
+- **Exercised:** the Start here and Latest month views, all five core analyses plus the portfolio module on the synthetic dataset, through the running app in a headless browser. The run-bundle export → CSV import → identical results round trip. The live-provider failure path: no network was available in the build environment, and the app showed a source-specific error per symbol and pointed to CSV import. `pytest`: 48 tests covering return shifts, month boundaries, incomplete months, release-time joins and restatements, dividend/split handling, missing and constant features, recovery of a known interaction with an exact check of the covariance-based slope SE, look-ahead invariance, matched-date metrics with negative OOS R², and portfolio feasibility, weights, monthly annualization, drift, execution timing, costs and delisting.
 - **Not exercised here:** live downloads from yfinance, FRED, BoC Valet and FMP, because the build host had no access to those sites. Run Live mode once on your Mac to confirm. QuantConnect/LEAN (`integrations/lean/`) is an untested example, and TSX coverage depends on your subscription. MSCI Barra is not implemented because it needs a licensed export.
 - **Approximations:** macro availability without vintages uses lag rules; FMP filing dates are unverified; the backtest uses close-to-close execution with a flat per-dollar cost; cash earns zero.
 
@@ -87,6 +117,7 @@ mfd/regression.py          OLS+HAC, diagnostics, BH, interactions, scenarios, ro
 mfd/forecast.py            walk-forward evaluation, metrics, empirical intervals
 mfd/portfolio.py           PyPortfolioOpt weights, rebalancing backtest, performance summary
 mfd/charts.py              Plotly figures
+mfd/live.py                on-demand latest quotes and return attribution
 mfd/provenance.py          run config, fingerprints, export bundles
 templates/                 CSV templates
 tests/                     pytest suite

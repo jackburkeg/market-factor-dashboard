@@ -14,6 +14,7 @@ import streamlit as st
 
 from mfd import charts as C
 from mfd import forecast as F
+from mfd import live as LV
 from mfd import portfolio as P
 from mfd import regression as R
 from mfd.config import (APP_TITLE, AnalysisSettings, BENCHMARKS, DEFAULT_TICKERS, FACTOR_SPECS, FIRM_FEATURES,
@@ -183,6 +184,7 @@ def _restore_from_bundle(cfg: dict):
 # =========================================================================== sidebar
 sb = st.sidebar
 sb.title(APP_TITLE)
+sb.markdown("**1 · Choose data**")
 mode = sb.radio("Data mode", ["Synthetic (labelled)", "Live providers", "CSV import"], key="w_mode",
                 help="Synthetic exercises every feature with a known data-generating process. Live uses yfinance, "
                      "FRED and Bank of Canada Valet (personal research use). CSV import works offline.")
@@ -268,6 +270,7 @@ meta = data["metadata"]
 bench_candidates = [s for s in all_syms if s in BENCHMARKS or s.startswith("SYN-MKT") or s.startswith("SYN-ENERGY")
                     or s.startswith("X")] or all_syms
 default_bench = ("SYN-MKT" if SYN else (DEFAULT_BENCHMARK if DEFAULT_BENCHMARK in all_syms else bench_candidates[0]))
+sb.markdown("**2 · Choose stocks and dates**")
 benchmark = sel(sb, "Benchmark (market factor)", all_syms, default_bench, "w_benchmark",
                          help="Its monthly total return is the market control. XIC.TO = broad Canadian market; "
                               "XEG.TO = Canadian energy.")
@@ -287,6 +290,7 @@ start_m, end_m = pd.Period(start_s, "M"), pd.Period(end_s, "M")
 macro_factors = sorted(data["macro"]["factor"].unique()) if data.get("macro") is not None and len(data["macro"]) else []
 has_fund = data.get("fundamentals") is not None and len(data["fundamentals"]) > 0
 factor_opts = ["market"] + macro_factors
+sb.markdown("**3 · Choose what to test**")
 factors = msel(sb, "Market & macro factors", factor_opts, DEFAULTS.factors, "w_factors",
                format_func=lambda k: FACTOR_LABELS.get(k, k))
 firm_opts = list(FIRM_FEATURES) if has_fund else []
@@ -294,7 +298,7 @@ firm = msel(sb, "Company fundamentals", firm_opts, DEFAULTS.firm_features, "w_fi
                       format_func=lambda k: FIRM_FEATURES[k]["label"],
                       disabled=not has_fund,
                       help=None if has_fund else "Needs dated fundamentals: upload a fundamentals CSV.")
-with sb.expander("Estimation settings", expanded=False):
+with sb.expander("Advanced settings", expanded=False):
     hac_rule = st.radio("HAC lag rule", ["fixed", "newey_west"], key="w_hac_rule",
                         format_func=lambda x: "Fixed lags" if x == "fixed" else "Newey–West plug-in",
                         help="Heteroscedasticity- and autocorrelation-consistent (Newey–West) standard errors.")
@@ -343,11 +347,192 @@ if "results" not in st.session_state:
     st.session_state.results = {}
 RES = st.session_state.results
 
-tabs = st.tabs(["Overview", "Stock drivers", "Interactions", "Rolling relationships", "Forecast validation",
-                "Portfolio", "Data & exports"])
+(t_home, t_today, t_over, t_drv, t_int, t_roll, t_fc, t_pf, t_exp) = st.tabs(
+    ["Start here", "Latest month", "Data", "What moves each stock", "Oil × debt", "Stability over time",
+     "Can it predict?", "Portfolio", "Export"])
+
+FITS, FIT_ERRS = (_fits(panel, pkey, tuple(tickers), tuple(X), start_m, eff_end, hac_rule, int(hac_lags))
+                  if X else ({}, {}))
+BETAS = pd.DataFrame({s: r.params for s, r in FITS.items()}).T if FITS else pd.DataFrame()
+n_months = len(pd.period_range(start_m, eff_end, freq="M"))
+
+
+def _sig(q):
+    return "clear" if pd.notna(q) and q < 0.05 else "not clearly different from zero"
+
+
+# =========================================================================== Start here
+with t_home:
+    st.subheader("What this dashboard does")
+    st.markdown("It asks how the stocks in your watchlist have moved with **the market, oil prices, interest rates "
+                "and the Canadian dollar**, and whether **company debt and earnings** change those relationships. "
+                "It then tests whether any of this **predicts next month's returns** better than simple guesses, "
+                "and explores a low-risk **portfolio**. Everything is calculated from historical monthly data.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Data source", "Demo" if SYN else mode.split()[0], help="Synthetic demo data" if SYN else mode)
+    c2.metric("Stocks", len(tickers))
+    c3.metric("Months analysed", n_months, help=f"{start_m} to {eff_end}")
+    c4.metric("Latest prices", prices["session_date"].max().strftime("%b %d, %Y"))
+
+    st.subheader(f"Key findings, {start_m} to {eff_end}")
+    if not FITS:
+        st.info("Select at least one factor in the sidebar to see findings.")
+    else:
+        eff_all = R.effects_table(FITS)
+        lines = []
+        if "oil" in X:
+            o = eff_all[eff_all.term == "oil"].sort_values("effect", ascending=False)
+            top, bot = o.iloc[0], o.iloc[-1]
+            lines.append(f"**Oil:** when WTI rose 10% in a month, **{top.symbol}** tended to move the most "
+                         f"({top.effect * 100:+.1f} percentage points, range {top.effect_ci_low * 100:+.1f} to "
+                         f"{top.effect_ci_high * 100:+.1f}) and **{bot.symbol}** the least ({bot.effect * 100:+.1f} pp). "
+                         + (f"Both links were {_sig(top.q_value)}." if _sig(top.q_value) == _sig(bot.q_value) else
+                            f"The link was {_sig(top.q_value)} for {top.symbol} and {_sig(bot.q_value)} for {bot.symbol}."))
+        if "market" in X:
+            m = eff_all[eff_all.term == "market"].sort_values("estimate")
+            lines.append(f"**Market:** betas ranged from {m.iloc[0].estimate:.2f} ({m.iloc[0].symbol}, steadiest relative "
+                         f"to the benchmark) to {m.iloc[-1].estimate:.2f} ({m.iloc[-1].symbol}). A beta of 1 means the "
+                         "stock tended to move one-for-one with the market.")
+        for f, name in (("rate", "Interest rates"), ("fx", "USD/CAD")):
+            if f in X:
+                g = eff_all[eff_all.term == f]
+                clear = g[g.q_value < 0.05]["symbol"].tolist()
+                lines.append(f"**{name}:** a clear association in {len(clear)} of {len(g)} stocks"
+                             + (f" ({', '.join(clear)})." if clear else "."))
+        if {"oil", "debt_to_assets"} <= set(panel.columns) and "debt_to_assets" in X:
+            hits, n_ok = [], 0
+            for s in tickers:
+                d = panel[panel.symbol == s].set_index("month")
+                d = d[(d.index >= start_m) & (d.index <= eff_end)]
+                try:
+                    ri = R.fit_interaction(d, "ret", "oil", "debt_to_assets",
+                                           [x for x in X if x not in ("oil", "debt_to_assets")], s, hac_rule, int(hac_lags))
+                    n_ok += 1
+                    if ri.pvalues["oil_x_debt_to_assets"] < 0.05 and ri.params["oil_x_debt_to_assets"] > 0:
+                        hits.append(s)
+                except R.ModelSpecError:
+                    pass
+            lines.append(f"**Oil × debt:** in {len(hits)} of {n_ok} stocks, oil sensitivity was clearly higher in "
+                         f"periods when the company carried more debt" + (f" ({', '.join(hits)})." if hits else ".")
+                         + " (Raw p < 0.05, not adjusted for multiple tests; see *Oil × debt* for details.)")
+        st.markdown("\n\n".join(f"- {l}" for l in lines))
+        for s, e in FIT_ERRS.items():
+            st.warning(e)
+        st.caption("“Clear” = Benjamini–Hochberg q < 0.05. These are historical associations, not causes. "
+                   "Ranges are 95% confidence intervals.")
+    home_forecast = st.empty()
+    home_portfolio = st.empty()
+
+    st.subheader("How to use it")
+    st.markdown("""
+1. **Pick your data and stocks** in the left sidebar. *Synthetic* is a built-in demo with known answers. *Live* downloads real prices. *CSV import* uses your own files.
+2. **Latest month**: what explained last month's moves for each stock, plus this month so far in Live mode.
+3. **What moves each stock**: how strongly each stock has moved with each factor, with uncertainty ranges.
+4. **Oil × debt**: whether oil sensitivity depends on how indebted the company is.
+5. **Stability over time**: whether those relationships held steady or shifted.
+6. **Can it predict?**: an honest test of next-month forecasts against simple baselines.
+7. **Portfolio**: a minimum-risk mix of the stocks compared with equal weights, including trading costs.
+8. **Export**: download every table, or a bundle that reproduces this exact analysis.
+""")
+    with st.expander("Glossary (plain-language definitions)"):
+        st.markdown("""
+- **Beta / sensitivity**: how much a stock's monthly return tended to move per unit move in a factor.
+- **Percentage point (pp)**: the difference between two percentages (5% → 7% is +2 pp).
+- **Basis point (bp)**: one hundredth of a percentage point (25 bp = 0.25 pp).
+- **Log change**: a way of measuring percentage moves that adds up neatly over time. A +10% move is log(1.10) ≈ 0.095.
+- **USD/CAD**: Canadian dollars per US dollar. When it rises, the Canadian dollar has weakened.
+- **Confidence interval (95%)**: the range of values consistent with the data. If it excludes zero, the association is unlikely to be noise.
+- **HAC standard errors**: uncertainty estimates that allow for volatile periods and month-to-month carry-over in the data.
+- **q-value**: a p-value adjusted for testing many coefficients at once (false discovery rate).
+- **Interaction**: when one factor's effect depends on another (e.g. oil matters more for indebted companies).
+- **Out-of-sample R²**: how much better a forecast did than simply predicting the historical average. Below 0 means worse.
+- **Ledoit–Wolf shrinkage**: a standard way to stabilize a covariance estimate from limited data.
+- **Drawdown**: the fall from a previous peak value.
+- **Total return**: price change plus dividends.
+""")
+
+# =========================================================================== Latest month / today
+with t_today:
+    st.subheader(f"What explained {eff_end}'s moves")
+    comps = [f for f in ("market", "oil", "rate", "fx") if f in X]
+    if BETAS.empty or not comps:
+        st.info("Needs at least one market/macro factor and a successful fit (see *What moves each stock*).")
+    else:
+        last = panel[panel.month == eff_end].set_index("symbol")
+        moves = {f: last[f].dropna().iloc[0] if f in last and last[f].notna().any() else np.nan for f in comps}
+        att = LV.attribute(last["ret"], BETAS, moves)
+        if att.empty:
+            st.info(f"No complete returns for {eff_end}.")
+        else:
+            mv = []
+            if "market" in moves: mv.append(f"benchmark {pct(moves['market'], 1)}")
+            if "oil" in moves: mv.append(f"WTI {pct(math.exp(moves['oil']) - 1, 1)}")
+            if "rate" in moves: mv.append(f"policy rate {moves['rate'] * 100:+.0f} bp")
+            if "fx" in moves: mv.append(f"USD/CAD {pct(math.exp(moves['fx']) - 1, 1)}")
+            st.markdown("**Factor moves that month:** " + " · ".join(mv))
+            st.plotly_chart(C.attribution_bar(att, comps, f"{eff_end}: return split into factor contributions", SYN),
+                            width="stretch")
+            biggest = att.reindex(att["stock_specific"].abs().sort_values(ascending=False).index).iloc[0]
+            st.markdown(f"Each bar adds the factor contributions (beta × that month's factor move) and the remaining "
+                        f"stock-specific part; the diamond is the actual return. The largest stock-specific move was "
+                        f"**{biggest.symbol}** ({biggest.stock_specific * 100:+.1f} pp), i.e. news particular to that "
+                        "company or factors not in the model.")
+            st.dataframe((att.set_index("symbol") * 100).round(2).rename(columns={
+                "actual": "actual return", **{k: v for k, v in C.COMPONENT_LABELS.items()},
+                "explained_by_factors": "explained by factors"}).reset_index(), hide_index=True, width="stretch")
+            st.caption("Values in percentage points. Betas are estimated over the selected window, so the split is "
+                       "descriptive, not causal.")
+
+    st.subheader("This month so far")
+    if mode != "Live providers":
+        st.info("Switch the sidebar **Data mode** to *Live providers* to see this month's moves for the real "
+                "watchlist. This uses one download per stock, only when you press refresh.")
+    elif BETAS.empty:
+        st.info("Needs a successful model fit first.")
+    else:
+        @st.cache_data(ttl=900, show_spinner="Fetching latest closes…")
+        def _snapshot(syms):
+            from mfd.live import fetch_snapshot
+            return fetch_snapshot(list(syms))
+        if st.button("Refresh latest quotes", help="Downloads once and caches for 15 minutes. Nothing refreshes automatically."):
+            st.session_state.live_snapshot = _snapshot(tuple(tickers) + (benchmark,))
+            st.session_state.live_snapshot_at = pd.Timestamp.now(tz="America/Toronto")
+        snap = st.session_state.get("live_snapshot")
+        if snap is None:
+            st.caption("Press **Refresh latest quotes** to load this month's moves.")
+        else:
+            from mfd.live import LIVE_FACTOR_SYMBOLS, attribute, period_moves
+            snap_df, probs = snap
+            for p in probs:
+                st.warning(p)
+            series = {r.symbol: r.series for r in snap_df.itertuples()} if len(snap_df) else {}
+            last_month_end = pd.Timestamp(pan["month_calendar"].dropna(subset=["last_session"])["last_session"].max())
+            pm = period_moves(series, last_month_end)
+            if pm.empty:
+                st.error("No quotes could be loaded.")
+            else:
+                pm = pm.set_index("symbol")
+                st.caption(f"Fetched {st.session_state.live_snapshot_at:%Y-%m-%d %H:%M} Toronto time. Month-to-date = "
+                           f"latest close vs the {last_month_end.date()} close. Free Yahoo quotes can be delayed.")
+                tbl = pm[["last_close", "as_of", "day_change", "period_return"]].rename(
+                    columns={"day_change": "last day", "period_return": "month to date"})
+                st.dataframe(tbl.style.format({"last_close": "{:.2f}", "last day": "{:+.2%}", "month to date": "{:+.2%}"}),
+                             width="stretch")
+                fm = {"market": pm["period_return"].get(benchmark, np.nan)}
+                for f, (ysym, _, _) in LIVE_FACTOR_SYMBOLS.items():
+                    fm[f] = pm["period_log"].get(ysym, np.nan)
+                fm = {k: v for k, v in fm.items() if k in comps}
+                att_live = attribute(pm["period_return"].reindex(tickers).dropna(), BETAS, fm)
+                if len(att_live):
+                    st.plotly_chart(C.attribution_bar(att_live, [c for c in comps if c in fm],
+                                                      "Month to date: return split into factor contributions"), width="stretch")
+                    st.caption("Oil uses the front-month WTI future (CL=F) and USD/CAD uses CAD=X as live proxies. "
+                               "The policy rate is not moved intra-month. Applying monthly betas to a partial month is "
+                               "an approximation.")
+
 
 # =========================================================================== Overview
-with tabs[0]:
+with t_over:
     st.subheader("Universe")
     cols = [c for c in ["symbol", "name", "subsector", "exchange", "currency", "provider_exchange", "provider_currency",
                         "currency_check", "status", "notes", "first_trade_date"] if c in meta]
@@ -398,7 +583,7 @@ with tabs[0]:
                             "contemporaneous control in descriptive models and lagged in forecasts.")
 
 # =========================================================================== Stock drivers
-with tabs[1]:
+with t_drv:
     st.subheader("Historical sensitivity (descriptive, full selected window)")
     st.markdown('<p class="small-note">One OLS regression per stock: monthly total return on the selected factors. '
                 'Macro factors are contemporaneous (same month); fundamentals are the latest values known before the '
@@ -407,7 +592,7 @@ with tabs[1]:
     if not X:
         st.warning("Select at least one factor in the sidebar.")
     else:
-        fits, errs = _fits(panel, pkey, tuple(tickers), tuple(X), start_m, eff_end, hac_rule, int(hac_lags))
+        fits, errs = FITS, FIT_ERRS
         for s, e in errs.items():
             st.error(e)
         if fits:
@@ -486,7 +671,7 @@ with tabs[1]:
                 st.dataframe(pd.DataFrame({s: R.standardized_coefs(f) for s, f in fits.items()}).round(3), width="stretch")
 
 # =========================================================================== Interactions
-with tabs[2]:
+with t_int:
     st.subheader("Interaction: does one factor's sensitivity depend on another?")
     st.markdown('<p class="small-note">Model: return = controls + β<sub>a</sub>·a + β<sub>b</sub>·(b − b̄) + '
                 'β<sub>int</sub>·a·(b − b̄). With b centered at its window mean b̄, β<sub>a</sub> is the sensitivity '
@@ -578,7 +763,7 @@ with tabs[2]:
                 st.warning("Extrapolation: " + e)
 
 # =========================================================================== Rolling
-with tabs[3]:
+with t_roll:
     st.subheader("Rolling relationships — coefficient stability analysis")
     st.markdown(f'<p class="small-note">At each window end the model is refit using only the trailing {roll_window} '
                 f'months. Consecutive windows share {roll_window - 1} of {roll_window} months '
@@ -628,7 +813,7 @@ with tabs[3]:
                 st.write("\n".join(rsk[:200]))
 
 # =========================================================================== Forecast validation
-with tabs[4]:
+with t_fc:
     st.subheader("Forecast validation — out-of-sample, chronological")
     st.markdown('<p class="small-note">Separate from the descriptive views. Each forecast of month t+1 uses only '
                 'information available at month t’s decision cutoff (lagged returns, macro values released by then, '
@@ -686,6 +871,16 @@ with tabs[4]:
                        "(stock, month) pairs across all four models.")
             met = F.metrics(seg)
             if len(met):
+                mm = met.set_index("model")["oos_r2_vs_hist_mean"]
+                best = mm.drop(["hist_mean", "zero"], errors="ignore")
+                if len(best):
+                    bname = best.idxmax()
+                    verdict = ("did slightly better than" if best.max() > 0.01 else
+                               "did about the same as" if best.max() > -0.01 else "did worse than")
+                    home_forecast.markdown(
+                        f"- **Prediction test:** the best model ({F.MODEL_LABELS[bname]}) {verdict} simply predicting the "
+                        f"historical average return (out-of-sample R² {best.max():+.3f} over {int(met['n_forecasts'].iloc[0])} "
+                        "stock-months). Monthly stock returns are mostly unpredictable, so values near zero are normal.")
                 met["model"] = met["model"].map(F.MODEL_LABELS)
             st.markdown("**Pooled across stocks**")
             st.dataframe(met, hide_index=True, width="stretch",
@@ -733,7 +928,7 @@ with tabs[4]:
                     st.write("\n".join(fsk[:300]))
 
 # =========================================================================== Portfolio
-with tabs[5]:
+with t_pf:
     st.subheader("Portfolio exploration (PyPortfolioOpt)")
     st.markdown('<p class="small-note">Long-only minimum-volatility weights from a Ledoit–Wolf shrunk covariance of '
                 'monthly total returns (annualized with frequency = 12), compared with equal weights in the same '
@@ -794,6 +989,13 @@ with tabs[5]:
             rf = lv / 100 / 12
             rf_label = "BoC policy-rate level at the decision cutoff ÷ 12 (approximate CAD cash return; not a T-bill series)"
         summ = P.performance_summary(res, rf, rf_label)
+        _s = summ.set_index("strategy")
+        if {"min_vol", "equal_weight"} <= set(_s.index):
+            home_portfolio.markdown(
+                f"- **Portfolio:** the minimum-volatility mix had annual volatility of {pct(_s.loc['min_vol', 'net_ann_vol'], 1)} "
+                f"vs {pct(_s.loc['equal_weight', 'net_ann_vol'], 1)} for equal weights, with net annual returns of "
+                f"{pct(_s.loc['min_vol', 'net_ann_return'], 1)} vs {pct(_s.loc['equal_weight', 'net_ann_return'], 1)} "
+                f"({_s.loc['min_vol', 'first_execution']} to {_s.loc['min_vol', 'last_period_end']}, after costs).")
         RES["backtest"] = res
         RES["weights_history"] = wh
         g1, g2 = st.columns(2)
@@ -816,7 +1018,7 @@ with tabs[5]:
         st.error(f"Backtest: {e}")
 
 # =========================================================================== Data & exports
-with tabs[6]:
+with t_exp:
     st.subheader("Exports and reproducibility")
     cfg = run_config(settings, data, data.get("provider_meta", {}),
                      extra={"analysis_window": {"start": str(start_m), "end": str(eff_end)},

@@ -317,3 +317,25 @@ def drawdown_plot(res: pd.DataFrame, synthetic=False):
                                  hovertemplate=f"{s} %{{x|%Y-%m-%d}}: %{{y:.1f}}%<extra></extra>"))
     fig.update_yaxes(title="drawdown from peak (%)")
     return _style(fig, "Drawdowns (net)", 300, synthetic=synthetic)
+
+
+# --------------------------------------------------------------------------- attribution
+COMPONENT_LABELS = {"market": "Market", "oil": "Oil", "rate": "Interest rate", "fx": "USD/CAD",
+                    "stock_specific": "Stock-specific (unexplained)"}
+
+
+def attribution_bar(att: pd.DataFrame, components, title: str, synthetic=False):
+    """Horizontal stacked bars: factor contributions + stock-specific remainder; a marker for the actual return."""
+    fig = go.Figure()
+    comps = [c for c in components if c in att] + ["stock_specific"]
+    for i, c in enumerate(comps):
+        color = NEUTRAL if c == "stock_specific" else SERIES[i]
+        fig.add_trace(go.Bar(y=att["symbol"], x=att[c] * 100, name=COMPONENT_LABELS.get(c, c), orientation="h",
+                             marker=dict(color=color, line=dict(color=SURFACE, width=2)),
+                             hovertemplate=f"%{{y}} · {COMPONENT_LABELS.get(c, c)}: %{{x:+.2f}} pp<extra></extra>"))
+    fig.add_trace(go.Scatter(y=att["symbol"], x=att["actual"] * 100, mode="markers", name="Actual return",
+                             marker=dict(symbol="diamond", size=11, color=TEXT, line=dict(color=SURFACE, width=2)),
+                             hovertemplate="%{y} actual return: %{x:+.2f}%<extra></extra>"))
+    fig.update_layout(barmode="relative")
+    fig.update_xaxes(title="contribution to return (percentage points)", zeroline=True, zerolinecolor="#9a998f")
+    return _style(fig, title, 90 + 46 * len(att), synthetic=synthetic)
