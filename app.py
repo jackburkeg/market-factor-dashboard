@@ -12,7 +12,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from mfd import charts as C
+
+def _fresh_mfd_modules():
+    """When hosted apps pull a new commit, Streamlit reruns app.py but can keep older copies of the
+    mfd package in memory. If any mfd file changed on disk, drop the cached modules so they re-import."""
+    import sys
+    from pathlib import Path
+    root = Path(__file__).with_name("mfd")
+    stamp = tuple(sorted((str(p), p.stat().st_mtime_ns) for p in root.rglob("*.py")))
+    pkg = sys.modules.get("mfd")
+    if pkg is not None and getattr(pkg, "_source_stamp", None) != stamp:
+        for name in [m for m in sys.modules if m == "mfd" or m.startswith("mfd.")]:
+            del sys.modules[name]
+    import mfd
+    mfd._source_stamp = stamp
+
+
+_fresh_mfd_modules()
+
+from mfd import charts as C  # noqa: E402
 from mfd import forecast as F
 from mfd import live as LV
 from mfd import portfolio as P
