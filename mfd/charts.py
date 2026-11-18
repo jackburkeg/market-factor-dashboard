@@ -92,7 +92,7 @@ def coefficient_plot(eff: pd.DataFrame, colors: dict, use_effect=True, synthetic
             showlegend=False), row=1, col=j)
         if truth is not None and val == "estimate":
             tt = truth.set_index("symbol")
-            tcol = {"debt_to_assets_c": "debt_to_assets", "oil_x_debt_to_assets": "oil_x_debt"}.get(t, t)
+            tcol = {"debt_to_assets_c": "debt_to_assets", "profitability_c": "profitability"}.get(t, t)
             if tcol in tt:
                 tv = tt[tcol].reindex(g["symbol"])
                 fig.add_trace(go.Scatter(x=tv.values, y=g["symbol"], mode="markers", name="true value (synthetic)",
@@ -321,6 +321,8 @@ def drawdown_plot(res: pd.DataFrame, synthetic=False):
 
 # --------------------------------------------------------------------------- attribution
 COMPONENT_LABELS = {"market": "Market", "oil": "Oil", "rate": "Interest rate", "fx": "USD/CAD",
+                    "control": "AI-leader control (NVDA)", "y10": "10-yr yield", "ffr": "Fed funds", "vix": "VIX",
+                    "usd": "US dollar",
                     "stock_specific": "Stock-specific (unexplained)"}
 
 

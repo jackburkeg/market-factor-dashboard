@@ -17,21 +17,29 @@ import pandas as pd
 
 from .providers.base import ProviderError
 
-# Yahoo proxies for the live factor moves
-LIVE_FACTOR_SYMBOLS = {
-    "oil": ("CL=F", "WTI crude front-month future (proxy for the WTI spot series)", "log"),
-    "fx": ("CAD=X", "USD/CAD (CAD per USD)", "log"),
+# Yahoo proxies for live factor moves, per preset: factor → (symbol, description, "log" | "diff")
+LIVE_PROXIES = {
+    "canada_energy": {
+        "oil": ("CL=F", "WTI crude front-month future (proxy for the WTI spot series)", "log"),
+        "fx": ("CAD=X", "USD/CAD (CAD per USD)", "log"),
+    },
+    "us_tech": {
+        "y10": ("^TNX", "CBOE 10-year Treasury yield index (percent)", "diff"),
+        "vix": ("^VIX", "CBOE Volatility Index", "log"),
+        "usd": ("DX-Y.NYB", "ICE US Dollar Index (DXY, a narrower proxy for the broad index)", "log"),
+    },
 }
+LIVE_FACTOR_SYMBOLS = LIVE_PROXIES["canada_energy"]
 
 
-def fetch_snapshot(symbols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+def fetch_snapshot(symbols: list[str], profile: str = "canada_energy") -> tuple[pd.DataFrame, list[str]]:
     """Latest daily closes over ~2 months for symbols + factor proxies (one request per symbol)."""
     try:
         import yfinance as yf
     except ImportError:
         raise ProviderError("yfinance", "package not installed") from None
     rows, problems = [], []
-    for sym in list(symbols) + [v[0] for v in LIVE_FACTOR_SYMBOLS.values()]:
+    for sym in list(symbols) + [v[0] for v in LIVE_PROXIES[profile].values()]:
         try:
             h = yf.Ticker(sym).history(period="3mo", interval="1d", auto_adjust=True, raise_errors=True)
             if h is None or h.empty:
@@ -54,7 +62,8 @@ def period_moves(series_by_symbol: dict, start_level_date: pd.Timestamp) -> pd.D
         b, last = float(base.iloc[-1]), float(s.iloc[-1])
         prev = float(s.iloc[-2]) if len(s) > 1 else np.nan
         out.append(dict(symbol=sym, last_close=last, as_of=s.index[-1].date(), day_change=last / prev - 1 if prev else np.nan,
-                        period_return=last / b - 1, period_log=math.log(last / b) if last > 0 and b > 0 else np.nan))
+                        period_return=last / b - 1, period_log=math.log(last / b) if last > 0 and b > 0 else np.nan,
+                        period_diff=last - b))
     return pd.DataFrame(out)
 
 

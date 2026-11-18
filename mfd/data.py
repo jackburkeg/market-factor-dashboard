@@ -3,24 +3,28 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .config import UNIVERSE_METADATA, FACTOR_SPECS
+from .config import FACTOR_SPECS, PROFILES, DEFAULT_PROFILE
 from .providers import csv_import, synthetic
 from .providers.base import ProviderError
 from .providers.macro import fetch_macro
 from .providers.market import YFinanceProvider
 
 
-def load_synthetic():
-    d = synthetic.generate()
+def load_synthetic(profile: str = DEFAULT_PROFILE):
+    d = synthetic.generate(profile)
     pm = {"prices": {"source": "SYNTHETIC", "seed": synthetic.SEED}, "macro": {"source": "SYNTHETIC"},
           "fundamentals": {"source": "SYNTHETIC"}}
     return dict(prices=d["prices"], macro=d["macro"], fundamentals=d["fundamentals"], metadata=d["metadata"],
-                truth=d["truth"], provider_meta=pm, problems=[], notes=[], synthetic=True)
+                truth=d["truth"], provider_meta=pm, problems=[], notes=[], synthetic=True,
+                control=d.get("control"))
 
 
-def load_live(symbols, benchmark, start, end, factors, refresh=False, fundamentals_csv=None, use_fmp=False):
+def load_live(symbols, benchmark, start, end, factors, refresh=False, fundamentals_csv=None, use_fmp=False,
+              profile: str = DEFAULT_PROFILE):
     problems, notes, pm = [], [], {}
-    prices, meta, p = YFinanceProvider().fetch(list(symbols) + [benchmark], start, end, refresh)
+    ctrl = PROFILES[profile].control_symbol
+    extra = [benchmark] + ([ctrl] if ctrl and ctrl not in symbols else [])
+    prices, meta, p = YFinanceProvider().fetch(list(symbols) + extra, start, end, refresh)
     problems += p
     pm["prices"] = {"provider": "yfinance", "auto_adjust": False, "actions": True,
                     "symbols": meta.to_dict("records") if len(meta) else []}
@@ -42,12 +46,12 @@ def load_live(symbols, benchmark, start, end, factors, refresh=False, fundamenta
                          "treat predictive results using them as approximate until release times are verified.")
         except ProviderError as e:
             problems.append(str(e))
-    md = metadata_table(meta)
+    md = metadata_table(meta, profile=profile)
     return dict(prices=prices, macro=macro, fundamentals=fund, metadata=md, truth=None, provider_meta=pm,
-                problems=problems, notes=notes, synthetic=False)
+                problems=problems, notes=notes, synthetic=False, control=ctrl)
 
 
-def load_csv(prices_file, macro_file=None, fundamentals_file=None, metadata_file=None):
+def load_csv(prices_file, macro_file=None, fundamentals_file=None, metadata_file=None, profile: str = DEFAULT_PROFILE):
     notes = []
     prices, n = csv_import.load_prices(prices_file)
     notes += n
@@ -59,15 +63,18 @@ def load_csv(prices_file, macro_file=None, fundamentals_file=None, metadata_file
     if fundamentals_file is not None:
         fund, n = csv_import.load_fundamentals(fundamentals_file)
         notes += n
-    md = csv_import.load_metadata(metadata_file) if metadata_file is not None else metadata_table(None, prices)
+    md = (csv_import.load_metadata(metadata_file) if metadata_file is not None
+          else metadata_table(None, prices, profile=profile))
     pm = {"prices": {"source": "CSV"}, "macro": {"source": "CSV" if macro is not None else None},
           "fundamentals": {"source": "CSV" if fund is not None else None}}
     return dict(prices=prices, macro=macro, fundamentals=fund, metadata=md, truth=None, provider_meta=pm,
-                problems=[], notes=notes, synthetic=bool(prices["symbol"].astype(str).str.startswith("SYN-").all()))
+                problems=[], notes=notes, synthetic=bool(prices["symbol"].astype(str).str.startswith("SYN-").all()),
+                control=("SYN-CTRL" if "SYN-CTRL" in set(prices["symbol"]) else PROFILES[profile].control_symbol))
 
 
-def metadata_table(provider_meta: pd.DataFrame | None, prices: pd.DataFrame | None = None) -> pd.DataFrame:
-    base = pd.DataFrame(UNIVERSE_METADATA)
+def metadata_table(provider_meta: pd.DataFrame | None, prices: pd.DataFrame | None = None,
+                   profile: str = DEFAULT_PROFILE) -> pd.DataFrame:
+    base = pd.DataFrame(list(PROFILES[profile].universe))
     if provider_meta is not None and len(provider_meta):
         pmeta = provider_meta.rename(columns={"exchange": "provider_exchange", "currency": "provider_currency"})
         base = base.merge(pmeta, on="symbol", how="outer")

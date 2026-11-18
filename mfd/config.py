@@ -144,3 +144,120 @@ class AnalysisSettings:
 
     def to_dict(self):
         return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Additional factors (all FRED, no key needed) used by the US tech preset.
+# ---------------------------------------------------------------------------
+FACTOR_SPECS.update({
+    "y10": FactorSpec(
+        key="y10", label="10-year Treasury yield (change, pp)", source="fred", series_id="DGS10",
+        unit="percentage points", level_unit="percent", currency="USD", transformation="diff_pp",
+        publication_lag_days=1,
+        description="U.S. 10-year Treasury constant-maturity yield (FRED DGS10). Month-end level; the factor is the "
+                    "monthly change in percentage points (0.25 pp = 25 bp). Long-duration growth stocks are often "
+                    "sensitive to it. Treated as usable the next day."),
+    "ffr": FactorSpec(
+        key="ffr", label="Effective fed funds rate (change, pp)", source="fred", series_id="DFF",
+        unit="percentage points", level_unit="percent", currency="USD", transformation="diff_pp",
+        publication_lag_days=1,
+        description="Effective federal funds rate (FRED DFF), the U.S. policy rate in practice. Month-end level; "
+                    "factor is the monthly change in percentage points. Published the next business day."),
+    "vix": FactorSpec(
+        key="vix", label="VIX (log change)", source="fred", series_id="VIXCLS",
+        unit="log change", level_unit="index points", currency=None, transformation="log_change",
+        publication_lag_days=1,
+        description="CBOE Volatility Index close (FRED VIXCLS), the market's expected 30-day S&P 500 volatility "
+                    "(a 'fear gauge'). Factor is the monthly log change; +20% is log(1.20)."),
+    "usd": FactorSpec(
+        key="usd", label="Broad US dollar index (log change)", source="fred", series_id="DTWEXBGS",
+        unit="log change", level_unit="index (Jan 2006 = 100)", currency=None, transformation="log_change",
+        publication_lag_days=7,
+        description="Federal Reserve nominal broad U.S. dollar index (FRED DTWEXBGS). A rise means a stronger dollar, "
+                    "which can weigh on companies with large foreign sales. Published weekly (H.10), so treated as "
+                    "usable 7 days after the observation date."),
+})
+
+FIRM_FEATURES["profitability"] = dict(
+    label="Profitability (return on assets)",
+    unit="ratio per quarter (0.02 = 2%)",
+    definition="Net income for the latest reported period ÷ total assets at that period end (return on assets), "
+               "from the most recent report available before the decision cutoff. Negative for loss-making companies.",
+)
+
+
+@dataclass(frozen=True)
+class Profile:
+    key: str
+    label: str
+    exchange: str            # calendar: "TSX" | "NYSE"
+    currency: str
+    universe: tuple          # metadata dicts
+    benchmarks: dict
+    default_benchmark: str
+    macro_factors: tuple     # factor keys fetched from providers
+    default_factors: tuple
+    default_firm: tuple
+    interaction: tuple       # (factor a, moderator b)
+    interaction_label: str
+    interaction_question: str
+    headline_factor: str
+    control_symbol: str | None = None
+    control_label: str = ""
+    rf_factor: str | None = None       # factor whose level approximates a cash rate (for Sharpe)
+    rf_label: str = ""
+    rolling_window: int = 60
+    min_obs_rolling: int = 36
+    forecast_min_train: int = 60
+    cov_lookback: int = 60
+    synthetic_benchmark: str = "SYN-MKT"
+
+
+US_TECH_UNIVERSE = (
+    dict(symbol="ALAB", name="Astera Labs", exchange="NASDAQ", currency="USD", subsector="AI connectivity chips",
+         status="listed", notes="IPO March 2024: short history."),
+    dict(symbol="CRDO", name="Credo Technology", exchange="NASDAQ", currency="USD",
+         subsector="AI connectivity (active electrical cables, SerDes)", status="listed", notes="IPO January 2022."),
+    dict(symbol="NBIS", name="Nebius Group", exchange="NASDAQ", currency="USD", subsector="AI cloud (GPU infrastructure)",
+         status="listed", analysis_start="2024-11-01",
+         notes="Former Yandex N.V.; trading resumed Oct 2024 after a suspension. Earlier history belongs to a different "
+               "business and is excluded (analysis starts Nov 2024)."),
+    dict(symbol="ARM", name="Arm Holdings (ADS)", exchange="NASDAQ", currency="USD", subsector="Chip architecture / IP",
+         status="listed", notes="IPO September 2023."),
+    dict(symbol="IONQ", name="IonQ", exchange="NYSE", currency="USD", subsector="Quantum computing (loss-making)",
+         status="listed", notes="Listed via SPAC October 2021."),
+    dict(symbol="APLD", name="Applied Digital", exchange="NASDAQ", currency="USD",
+         subsector="AI data centres (loss-making)", status="listed", notes=""),
+    dict(symbol="CRWV", name="CoreWeave", exchange="NASDAQ", currency="USD", subsector="AI cloud",
+         status="listed", optional=True, notes="IPO March 2025: too little monthly history for most analyses."),
+    dict(symbol="CBRS", name="Cerebras Systems", exchange="NASDAQ", currency="USD", subsector="AI chips (wafer-scale)",
+         status="listed", optional=True, notes="IPO May 2026: too little monthly history for most analyses."),
+    dict(symbol="NVDA", name="NVIDIA", exchange="NASDAQ", currency="USD", subsector="Control: mature AI leader",
+         status="listed", control=True, notes="Used as a control factor, not as a target stock."),
+)
+
+PROFILES = {
+    "canada_energy": Profile(
+        key="canada_energy", label="Canada – Energy", exchange="TSX", currency="CAD",
+        universe=tuple(UNIVERSE_METADATA), benchmarks=BENCHMARKS, default_benchmark=DEFAULT_BENCHMARK,
+        macro_factors=("oil", "rate", "fx"), default_factors=("market", "oil", "rate", "fx"),
+        default_firm=("debt_to_assets", "earnings_growth"), interaction=("oil", "debt_to_assets"),
+        interaction_label="Oil × debt",
+        interaction_question="whether oil sensitivity depends on how indebted the company is",
+        headline_factor="oil", rf_factor="rate", rf_label="BoC policy rate", synthetic_benchmark="SYN-MKT"),
+    "us_tech": Profile(
+        key="us_tech", label="US – Tech (early-stage AI)", exchange="NYSE", currency="USD",
+        universe=US_TECH_UNIVERSE,
+        benchmarks={"QQQ": "Invesco QQQ (Nasdaq-100)", "SPY": "SPDR S&P 500 ETF",
+                    "SMH": "VanEck Semiconductor ETF"},
+        default_benchmark="QQQ",
+        macro_factors=("y10", "ffr", "vix", "usd"), default_factors=("market", "control", "y10", "vix"),
+        default_firm=("profitability",), interaction=("y10", "profitability"),
+        interaction_label="Rates × profitability",
+        interaction_question="whether sensitivity to the 10-year yield depends on how profitable the company is",
+        headline_factor="y10", control_symbol="NVDA", control_label="NVIDIA return (AI-leader control)",
+        rf_factor="ffr", rf_label="effective fed funds rate",
+        rolling_window=24, min_obs_rolling=18, forecast_min_train=24, cov_lookback=24,
+        synthetic_benchmark="SYN-NDX"),
+}
+DEFAULT_PROFILE = "canada_energy"

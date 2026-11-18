@@ -14,10 +14,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .calendar import tsx_sessions, latest_completed_month
+from .calendar import exchange_sessions, latest_completed_month
 from .config import FACTOR_SPECS, MARKET_TZ, DECISION_CUTOFF_HOUR
 
-FIRM_COLS = ["debt_to_assets", "earnings_growth", "earnings_change_scaled"]
+FIRM_COLS = ["debt_to_assets", "earnings_growth", "earnings_change_scaled", "profitability"]
 
 
 # --------------------------------------------------------------------------- prices
@@ -54,10 +54,10 @@ def observed_sessions(prices: pd.DataFrame) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(sorted(pd.to_datetime(prices["session_date"]).unique()))
 
 
-def month_calendar(prices: pd.DataFrame, start_month: pd.Period, end_month: pd.Period) -> pd.DataFrame:
+def month_calendar(prices: pd.DataFrame, start_month: pd.Period, end_month: pd.Period, exchange: str = "TSX") -> pd.DataFrame:
     """Per month: last session (data-driven where data exists, TSX calendar otherwise) and cutoff."""
     obs = observed_sessions(prices) if len(prices) else pd.DatetimeIndex([])
-    cal = tsx_sessions(start_month.start_time, end_month.end_time)
+    cal = exchange_sessions(start_month.start_time, end_month.end_time, exchange)
     rows = []
     for m in pd.period_range(start_month, end_month, freq="M"):
         o = obs[(obs >= m.start_time) & (obs <= m.end_time)]
@@ -193,6 +193,12 @@ def _features_from_state(state: dict, ptypes: dict, include_leases: bool, small_
                 rec.update(debt_to_assets=debt / assets, debt_period_end=pe,
                            debt_available_at=max(by_metric[m][pe][1] for m in need))
     ni = by_metric.get("net_income")
+    ta = by_metric.get("total_assets", {})
+    if ni:
+        common_ni = [q for q in ni if q in ta and ta[q][0] > 0]
+        if common_ni:
+            q = max(common_ni)
+            rec.update(profitability=ni[q][0] / ta[q][0], prof_available_at=max(ni[q][1], ta[q][1]))
     if ni:
         pe = max(ni)
         target = pe - pd.DateOffset(years=1)
@@ -250,13 +256,13 @@ def fundamentals_point_in_time(fund: pd.DataFrame, symbols, mcal: pd.DataFrame, 
         m = pd.merge_asof(cut, ev, left_on="decision_at", right_on="event_at", direction="backward")
         m["symbol"] = sym
         for feat, av, agecol in (("debt_to_assets", "debt_available_at", "debt_age_days"),
-                                 ("earnings_growth", "earn_available_at", "earn_age_days")):
+                                 ("earnings_growth", "earn_available_at", "earn_age_days"),
+                                 ("profitability", "prof_available_at", "prof_age_days")):
             if av in m:
                 m[agecol] = (m["decision_at"] - pd.to_datetime(m[av])).dt.days
                 stale = m[agecol] > max_age_days
-                if feat == "debt_to_assets":
-                    m.loc[stale, "debt_to_assets"] = np.nan
-                    m.loc[stale, "debt_flag"] = f"stale (> {max_age_days} days)"
+                if feat in ("debt_to_assets", "profitability"):
+                    m.loc[stale, feat] = np.nan
                 else:
                     for c in ("earnings_growth", "earnings_change_scaled"):
                         if c in m:
@@ -271,15 +277,25 @@ def fundamentals_point_in_time(fund: pd.DataFrame, symbols, mcal: pd.DataFrame, 
 
 # --------------------------------------------------------------------------- panel
 def build_panel(prices, macro, fund, symbols, benchmark, end_month=None, start_month=None,
-                convention="adjusted_close", include_leases=False, small_denominator_frac=0.002):
-    """Assemble descriptive and forecast rows for all symbols. Returns a dict of tables."""
-    asof_end = latest_completed_month()
+                convention="adjusted_close", include_leases=False, small_denominator_frac=0.002,
+                exchange="TSX", control=None, analysis_start=None):
+    """Assemble descriptive and forecast rows for all symbols. Returns a dict of tables.
+
+    control: optional symbol whose monthly total return becomes the 'control' factor (e.g. NVDA).
+    analysis_start: optional {symbol: date}; earlier prices are dropped (e.g. a different predecessor business).
+    """
+    if analysis_start:
+        keep = pd.Series(True, index=prices.index)
+        for sym, d in analysis_start.items():
+            keep &= ~((prices["symbol"] == sym) & (pd.to_datetime(prices["session_date"]) < pd.Timestamp(d)))
+        prices = prices[keep]
+    asof_end = latest_completed_month(exchange=exchange)
     end_month = min(end_month, asof_end) if end_month is not None else asof_end
     data_last = pd.Period(pd.to_datetime(prices["session_date"]).max(), freq="M")
     end_month = min(end_month, data_last)
     data_first = pd.Period(pd.to_datetime(prices["session_date"]).min(), freq="M")
     start_month = max(start_month, data_first) if start_month is not None else data_first
-    mcal = month_calendar(prices, start_month, end_month)
+    mcal = month_calendar(prices, start_month, end_month, exchange)
     notes = []
     last = mcal.iloc[-1]
     if pd.notna(last["calendar_last_session"]) and last["last_session"] < last["calendar_last_session"]:
@@ -287,13 +303,15 @@ def build_panel(prices, macro, fund, symbols, benchmark, end_month=None, start_m
                      f"last TSX session {pd.Timestamp(last['calendar_last_session']).date()} (incomplete month).")
         end_month = end_month - 1
         mcal = mcal.iloc[:-1]
-    tri =total_return_index(prices[prices["symbol"].isin(list(symbols) + [benchmark])], convention)
+    extra = [benchmark] + ([control] if control else [])
+    tri = total_return_index(prices[prices["symbol"].isin(list(symbols) + extra)], convention)
     tri = tri[tri.index <= mcal["last_session"].max()]
     mret, excluded = monthly_returns(tri, mcal, end_month)
     if mret.empty:
         raise ValueError("no complete monthly returns could be computed from the price data")
     months = pd.period_range(start_month, end_month, freq="M")
     bench = mret[mret["symbol"] == benchmark].set_index("month")["ret"].rename("market")
+    ctrl = mret[mret["symbol"] == control].set_index("month")["ret"] if control else None
     stocks = mret[mret["symbol"].isin(symbols)]
     mdesc = macro_descriptive(macro, months) if macro is not None and len(macro) else pd.DataFrame(index=months)
     mpit = macro_point_in_time(macro, mcal) if macro is not None and len(macro) else pd.DataFrame()
@@ -307,16 +325,20 @@ def build_panel(prices, macro, fund, symbols, benchmark, end_month=None, start_m
         df["symbol"] = sym
         df["ret"] = s
         df["market"] = bench.reindex(months)
+        if ctrl is not None and len(ctrl):
+            df["control"] = ctrl.reindex(months)
         for f in factor_names:
             df[f] = mdesc[f]
         fs = firm[firm["symbol"] == sym].set_index("month").reindex(months) if len(firm) else pd.DataFrame(index=months)
         # descriptive: known before month t  (= point-in-time at cutoff t-1)
-        for c in FIRM_COLS + ["earnings_transition", "debt_age_days", "earn_age_days"]:
+        for c in FIRM_COLS + ["earnings_transition", "debt_age_days", "earn_age_days", "prof_age_days"]:
             df[c] = fs[c].shift(1) if c in fs else np.nan
         # forecast features at decision month t
         df["decision_at"] = mcal.set_index("month")["decision_at"].reindex(months)
         df["lag_own"] = df["ret"]
         df["lag_market"] = df["market"]
+        if "control" in df:
+            df["lag_control"] = df["control"]
         if len(mpit):
             for f in mpit["factor"].unique():
                 df["lag_" + f] = mpit[mpit["factor"] == f].set_index("month")["value"].reindex(months)
@@ -325,7 +347,7 @@ def build_panel(prices, macro, fund, symbols, benchmark, end_month=None, start_m
         srcs = []
         if len(mpit):
             srcs.append(mpit.groupby("month")["source_available_at"].max().reindex(months))
-        for av in ("debt_available_at", "earn_available_at"):
+        for av in ("debt_available_at", "earn_available_at", "prof_available_at"):
             if av in fs:
                 srcs.append(pd.to_datetime(fs[av]))
         if srcs:
@@ -342,7 +364,7 @@ def build_panel(prices, macro, fund, symbols, benchmark, end_month=None, start_m
             ["symbol", "decision_at", "feature", "value", "source_available_at", "transformation", "availability_quality"]])
     if len(firm):
         for c, av in (("debt_to_assets", "debt_available_at"), ("earnings_growth", "earn_available_at"),
-                      ("earnings_change_scaled", "earn_available_at")):
+                      ("earnings_change_scaled", "earn_available_at"), ("profitability", "prof_available_at")):
             if c in firm and av in firm:
                 t = firm[["symbol", "decision_at", c, av]].dropna(subset=[c]).rename(columns={c: "value", av: "source_available_at"})
                 t["feature"], t["transformation"] = c, "as-of latest available report (carried forward)"

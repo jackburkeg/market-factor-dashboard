@@ -1,6 +1,11 @@
 # Market Factor Dashboard
 
-A local Streamlit app for studying how company fundamentals, oil prices, interest rates, the USD/CAD rate and the broad market relate to stock returns. The starter universe is Canadian energy. Tickers and factors can be edited.
+A Streamlit app for studying how company fundamentals, macro factors and the broad market relate to stock returns. It has two **market presets**, chosen at the top of the sidebar:
+
+- **Canada – Energy:** TSX energy stocks against WTI oil, the Bank of Canada policy rate and USD/CAD. The headline question is oil × debt.
+- **US – Tech (early-stage AI):** young AI-infrastructure stocks against the Nasdaq-100, NVIDIA as a control, the 10-year Treasury yield, the fed funds rate, the VIX and the US dollar. The headline question is rates × profitability.
+
+Tickers and factors stay editable in both presets.
 
 It covers five research tasks: per-stock factor sensitivities, interactions (e.g. oil × debt), rolling-window stability, out-of-sample forecast validation against simple baselines, and uncertainty plus historical prediction errors throughout. It also includes a small PyPortfolioOpt portfolio module.
 
@@ -57,7 +62,7 @@ you press a refresh button.
 
 | Mode | What it does |
 |---|---|
-| **Synthetic (labelled)** | A deterministic simulated dataset (seed 20261117) with known coefficients, including an oil × debt interaction, quarterly restatements, a mid-month delisting (SYN-GAS) and a short-history stock (SYN-NEW). Every page and export is labelled SYNTHETIC. In *Raw coefficient* view the true values are overlaid as × marks. |
+| **Synthetic (labelled)** | A deterministic simulated dataset per preset with known coefficients. Canada: an oil × debt interaction, quarterly restatements, a mid-month delisting (SYN-GAS) and a short-history stock. US tech: a 10-year-yield × profitability interaction, an AI-leader control (SYN-CTRL) and staggered listing dates. Every page and export is labelled SYNTHETIC; true values are overlaid in *Raw coefficient* view and on interaction curves. |
 | **Live providers** | Prices come from yfinance with `auto_adjust=False, actions=True`, giving split-adjusted Close, Adj Close, dividends and splits. WTI comes from FRED `DCOILWTICO`. The policy rate (`V39079`) and USD/CAD (`FXUSDCAD`) come from Bank of Canada Valet. Downloads are cached as Parquet snapshots in `data_cache/`; **Refresh data** bypasses the cache. Failures are reported per source. |
 | **CSV import** | Works offline. Upload prices, macro, fundamentals and metadata CSVs (templates in `templates/`), or upload a **run bundle** exported from the app to restore its inputs and settings. |
 
@@ -85,7 +90,25 @@ you press a refresh button.
 | Portfolio | Ledoit–Wolf covariance with `frequency=12` feeds a long-only minimum-volatility portfolio with a weight cap (default 25%) and a feasibility check, compared with equal weight. The backtest rebalances on then-available data and executes at the first session after the cutoff, using execution-to-execution returns with drift. Costs are traded notional × (fees + slippage), and half-turnover = traded/2. Results are shown gross and net, against buy-and-hold of the benchmark ETF. Sharpe appears only with an explicit CAD risk-free assumption. Delisted holdings become cash at their last close. |
 | Data & exports | CSVs for every table, a `run_config.json` (settings, sources, retrieval times, transformations, package versions, fingerprints) and a reproducible `.zip` bundle that reloads via CSV import. |
 
-## Starter universe (checked November 2026)
+## US tech preset (checked November 2026)
+
+| Symbol | Company | Role / note |
+|---|---|---|
+| ALAB | Astera Labs | AI connectivity chips; IPO March 2024 |
+| CRDO | Credo Technology | AI connectivity; IPO January 2022 |
+| NBIS | Nebius Group | AI cloud. Formerly Yandex N.V.; trading resumed October 2024, so earlier prices (a different business) are excluded and analysis starts November 2024 |
+| ARM | Arm Holdings | Chip architecture/IP; IPO September 2023 |
+| IONQ | IonQ | Quantum computing, loss-making |
+| APLD | Applied Digital | AI data centres, loss-making |
+| CRWV, CBRS | CoreWeave, Cerebras | Optional only: listed March 2025 and May 2026, too little monthly history |
+| NVDA | NVIDIA | **Control**: its monthly return is a factor (co-movement with the AI leader beyond the market), not a target stock |
+| QQQ / SPY / SMH | Benchmarks | Nasdaq-100 (default), S&P 500, semiconductors |
+
+The macro factors come from FRED with no key needed: `DGS10` (10-year yield, change in pp), `DFF` (fed funds, change in pp), `VIXCLS` (VIX, log change) and `DTWEXBGS` (broad dollar index, log change, weekly release). The interaction moderator is **profitability = net income ÷ total assets** (quarterly return on assets) from your fundamentals CSV.
+
+**Short histories are the main limitation.** Most of these companies have only 2–5 years of monthly data, so estimates are wide. This preset therefore defaults to 24-month rolling and covariance windows and a 24-month initial forecast training window, and any stock with too few months is reported rather than silently fitted. NYSE holidays and USD apply in this preset.
+
+## Canada energy preset (checked November 2026)
 
 | Symbol | Company | Subsector | Note |
 |---|---|---|---|
@@ -101,7 +124,7 @@ All are TSX listings quoted in CAD. At run time the app compares the provider's 
 
 ## Verification status of this build
 
-- **Exercised:** the Start here and Latest month views, all five core analyses plus the portfolio module on the synthetic dataset, through the running app in a headless browser. The run-bundle export → CSV import → identical results round trip. The live-provider failure path: no network was available in the build environment, and the app showed a source-specific error per symbol and pointed to CSV import. `pytest`: 48 tests covering return shifts, month boundaries, incomplete months, release-time joins and restatements, dividend/split handling, missing and constant features, recovery of a known interaction with an exact check of the covariance-based slope SE, look-ahead invariance, matched-date metrics with negative OOS R², and portfolio feasibility, weights, monthly annualization, drift, execution timing, costs and delisting.
+- **Exercised:** both presets, the Start here and Latest month views, all five core analyses plus the portfolio module on the synthetic dataset, through the running app in a headless browser. The run-bundle export → CSV import → identical results round trip. The live-provider failure path: no network was available in the build environment, and the app showed a source-specific error per symbol and pointed to CSV import. `pytest`: 53 tests covering return shifts, month boundaries, incomplete months, release-time joins and restatements, dividend/split handling, missing and constant features, recovery of a known interaction with an exact check of the covariance-based slope SE, look-ahead invariance, matched-date metrics with negative OOS R², and portfolio feasibility, weights, monthly annualization, drift, execution timing, costs and delisting.
 - **Not exercised here:** live downloads from yfinance, FRED, BoC Valet and FMP, because the build host had no access to those sites. Run Live mode once on your Mac to confirm. QuantConnect/LEAN (`integrations/lean/`) is an untested example, and TSX coverage depends on your subscription. MSCI Barra is not implemented because it needs a licensed export.
 - **Approximations:** macro availability without vintages uses lag rules; FMP filing dates are unverified; the backtest uses close-to-close execution with a flat per-dollar cost; cash earns zero.
 

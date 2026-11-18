@@ -17,8 +17,7 @@ from mfd import forecast as F
 from mfd import live as LV
 from mfd import portfolio as P
 from mfd import regression as R
-from mfd.config import (APP_TITLE, AnalysisSettings, BENCHMARKS, DEFAULT_TICKERS, FACTOR_SPECS, FIRM_FEATURES,
-                        DEFAULT_BENCHMARK)
+from mfd.config import (APP_TITLE, AnalysisSettings, FACTOR_SPECS, FIRM_FEATURES, PROFILES, DEFAULT_PROFILE)
 from mfd.data import load_csv, load_live, load_synthetic
 from mfd.prep import build_panel, coverage_table
 from mfd.providers.base import ProviderError, list_snapshots
@@ -93,26 +92,28 @@ def msel(container, label, options, default, key, **kw):
 
 # =========================================================================== data loading (cached)
 @st.cache_data(show_spinner="Generating deterministic synthetic dataset…")
-def _synthetic():
-    return load_synthetic()
+def _synthetic(preset):
+    return load_synthetic(preset)
 
 
 @st.cache_data(show_spinner="Downloading / reading cached provider data…")
-def _live(symbols, benchmark, start, end, factors, refresh_token, fund_bytes, use_fmp):
+def _live(symbols, benchmark, start, end, factors, refresh_token, fund_bytes, use_fmp, preset):
     return load_live(list(symbols), benchmark, start, end, list(factors), refresh=refresh_token > 0,
-                     fundamentals_csv=fund_bytes, use_fmp=use_fmp)
+                     fundamentals_csv=fund_bytes, use_fmp=use_fmp, profile=preset)
 
 
 @st.cache_data(show_spinner="Reading CSV files…")
-def _csv(prices_b, macro_b, fund_b, meta_b):
-    return load_csv(prices_b, macro_b, fund_b, meta_b)
+def _csv(prices_b, macro_b, fund_b, meta_b, preset):
+    return load_csv(prices_b, macro_b, fund_b, meta_b, profile=preset)
 
 
 @st.cache_data(show_spinner="Aligning returns, macro and fundamentals on the decision calendar…")
-def _panel(_data, data_key, symbols, benchmark, start_month, end_month, convention, include_leases, small_frac):
+def _panel(_data, data_key, symbols, benchmark, start_month, end_month, convention, include_leases, small_frac,
+           exchange, control, analysis_start):
     return build_panel(_data["prices"], _data["macro"], _data["fundamentals"], list(symbols), benchmark,
                        end_month=end_month, start_month=start_month, convention=convention,
-                       include_leases=include_leases, small_denominator_frac=small_frac)
+                       include_leases=include_leases, small_denominator_frac=small_frac, exchange=exchange,
+                       control=control, analysis_start=dict(analysis_start) if analysis_start else None)
 
 
 @st.cache_data(show_spinner="Fitting per-stock regressions…")
@@ -168,37 +169,52 @@ def _backtest(_p, key, symbols, benchmark, lookback, cap, fee, slip, every, char
 # =========================================================================== bundle restore
 def _restore_from_bundle(cfg: dict):
     s = cfg.get("settings", {})
+    pr = s.get("preset", DEFAULT_PROFILE)
+    st.session_state["_pending_preset"] = pr
     mapping = {"tickers": "w_tickers", "benchmark": "w_benchmark", "factors": "w_factors",
                "firm_features": "w_firm", "hac_lag_rule": "w_hac_rule", "hac_lags": "w_hac_lags",
                "rolling_window": "w_roll", "return_convention": "w_conv", "include_leases_in_debt": "w_leases",
-               "small_denominator_frac": "w_smallden"}
+               "small_denominator_frac": "w_smallden", "start": "w_start", "end": "w_end"}
     for k, w in mapping.items():
-        if k in s:
-            st.session_state[w] = s[k]
-    for k in ("start", "end"):
-        if s.get(k):
-            st.session_state["w_" + k] = s[k]
+        if s.get(k) not in (None, ""):
+            st.session_state[f"{w}__{pr}"] = s[k]
     st.session_state["restored_config"] = cfg
 
 
 # =========================================================================== sidebar
 sb = st.sidebar
 sb.title(APP_TITLE)
-sb.markdown("**1 · Choose data**")
+sb.markdown("**1 · Choose market and data**")
+if "_pending_preset" in st.session_state:
+    st.session_state["w_preset"] = st.session_state.pop("_pending_preset")
+preset = sb.selectbox("Market preset", list(PROFILES), key="w_preset", format_func=lambda k: PROFILES[k].label,
+                      help="Sets the default stocks, benchmarks, factors, trading calendar, currency and the "
+                           "interaction question. Everything stays editable.")
+PF = PROFILES[preset]
+
+
+def K(name: str) -> str:
+    """Widget keys are per preset, so switching presets never shows stale selections."""
+    return f"{name}__{preset}"
+
 mode = sb.radio("Data mode", ["Synthetic (labelled)", "Live providers", "CSV import"], key="w_mode",
-                help="Synthetic exercises every feature with a known data-generating process. Live uses yfinance, "
-                     "FRED and Bank of Canada Valet (personal research use). CSV import works offline.")
+                help="Synthetic exercises every feature with a known data-generating process. Live uses yfinance "
+                     "and FRED (plus Bank of Canada Valet for the Canada preset), for personal research use. "
+                     "CSV import works offline.")
 data, load_error = None, None
 if "refresh_token" not in st.session_state:
     st.session_state.refresh_token = 0
 
 if mode.startswith("Synthetic"):
-    data = _synthetic()
+    data = _synthetic(preset)
 elif mode == "Live providers":
-    tick_text = sb.text_input("Tickers (comma-separated)", ", ".join(DEFAULT_TICKERS), key="w_live_tickers")
+    default_live = [m["symbol"] for m in PF.universe if not m.get("optional") and not m.get("control")]
+    optional = [m["symbol"] for m in PF.universe if m.get("optional")]
+    tick_text = sb.text_input("Tickers (comma-separated)", ", ".join(default_live), key=K("w_live_tickers"),
+                              help=("Optional (very short history): " + ", ".join(optional)) if optional else None)
     live_syms = tuple(t.strip().upper() for t in tick_text.split(",") if t.strip())
-    bench_live = sb.text_input("Benchmark ETF", DEFAULT_BENCHMARK, key="w_live_bench",
-                               help="; ".join(f"{k}: {v}" for k, v in BENCHMARKS.items())).strip().upper()
+    bench_live = sb.text_input("Benchmark ETF", PF.default_benchmark, key=K("w_live_bench"),
+                               help="; ".join(f"{k}: {v}" for k, v in PF.benchmarks.items())).strip().upper()
     years = sb.number_input("Requested history (years)", 3, 30, DEFAULTS.history_years, key="w_years")
     fund_up = sb.file_uploader("Fundamentals CSV (optional, recommended)", type="csv", key="w_live_fund")
     import os
@@ -212,8 +228,8 @@ elif mode == "Live providers":
     start_d = end_d - pd.DateOffset(years=int(years))
     try:
         data = _live(live_syms, bench_live, start_d.date().isoformat(), end_d.date().isoformat(),
-                     ("oil", "rate", "fx"), st.session_state.refresh_token,
-                     fund_up.getvalue() if fund_up else None, use_fmp)
+                     PF.macro_factors, st.session_state.refresh_token,
+                     fund_up.getvalue() if fund_up else None, use_fmp, preset)
         if data["prices"].empty:
             load_error = ("No price data could be retrieved. Source-specific errors:\n\n" +
                           "\n".join(f"- {p}" for p in data["problems"]) +
@@ -242,7 +258,7 @@ else:
         load_error = "Upload a prices CSV (see templates/prices_template.csv) or a run bundle to begin."
     else:
         try:
-            data = _csv(pb, mb, fb, db)
+            data = _csv(pb, mb, fb, db, preset)
         except (CSVSchemaError, ValueError) as e:
             load_error = f"CSV import failed: {e}"
 
@@ -267,15 +283,17 @@ for p in data.get("problems", []):
 prices = data["prices"]
 all_syms = sorted(prices["symbol"].unique())
 meta = data["metadata"]
-bench_candidates = [s for s in all_syms if s in BENCHMARKS or s.startswith("SYN-MKT") or s.startswith("SYN-ENERGY")
-                    or s.startswith("X")] or all_syms
-default_bench = ("SYN-MKT" if SYN else (DEFAULT_BENCHMARK if DEFAULT_BENCHMARK in all_syms else bench_candidates[0]))
+SYN_BENCH = ("SYN-MKT", "SYN-ENERGY", "SYN-NDX", "SYN-SEMI")
+CONTROL = data.get("control") if data.get("control") in all_syms else None
+bench_candidates = [s for s in all_syms if s in PF.benchmarks or s in SYN_BENCH] or all_syms
+default_bench = (PF.synthetic_benchmark if SYN and PF.synthetic_benchmark in all_syms else
+                 (PF.default_benchmark if PF.default_benchmark in all_syms else bench_candidates[0]))
 sb.markdown("**2 · Choose stocks and dates**")
-benchmark = sel(sb, "Benchmark (market factor)", all_syms, default_bench, "w_benchmark",
-                         help="Its monthly total return is the market control. XIC.TO = broad Canadian market; "
-                              "XEG.TO = Canadian energy.")
-stock_opts = [s for s in all_syms if s not in BENCHMARKS and not s.startswith(("SYN-MKT", "SYN-ENERGY")) and s != benchmark]
-tickers = msel(sb, "Watchlist", stock_opts, stock_opts, "w_tickers")
+benchmark = sel(sb, "Benchmark (market factor)", all_syms, default_bench, K("w_benchmark"),
+                         help="Its monthly total return is the market factor. " +
+                              "; ".join(f"{k} = {v}" for k, v in PF.benchmarks.items()))
+stock_opts = [s for s in all_syms if s not in PF.benchmarks and s not in SYN_BENCH and s != benchmark and s != CONTROL]
+tickers = msel(sb, "Watchlist", stock_opts, stock_opts, K("w_tickers"))
 if not tickers:
     st.warning("Select at least one stock in the sidebar watchlist.")
     st.stop()
@@ -283,35 +301,38 @@ if not tickers:
 pmin = pd.Period(prices["session_date"].min(), "M")
 pmax = pd.Period(prices["session_date"].max(), "M")
 month_opts = [str(m) for m in pd.period_range(pmin, pmax, freq="M")]
-start_s = sel(sb, "Start month", month_opts, str(max(pmin, pmax - 12 * DEFAULTS.history_years)), "w_start")
-end_s = sel(sb, "End month (latest completed month by default)", month_opts, month_opts[-1], "w_end")
+start_s = sel(sb, "Start month", month_opts, str(max(pmin, pmax - 12 * DEFAULTS.history_years)), K("w_start"))
+end_s = sel(sb, "End month (latest completed month by default)", month_opts, month_opts[-1], K("w_end"))
 start_m, end_m = pd.Period(start_s, "M"), pd.Period(end_s, "M")
 
 macro_factors = sorted(data["macro"]["factor"].unique()) if data.get("macro") is not None and len(data["macro"]) else []
 has_fund = data.get("fundamentals") is not None and len(data["fundamentals"]) > 0
-factor_opts = ["market"] + macro_factors
+factor_opts = ["market"] + (["control"] if CONTROL else []) + macro_factors
+if CONTROL:
+    FACTOR_LABELS["control"] = f"{CONTROL} return (control)" if SYN else PF.control_label
+    FACTOR_UNITS["control"] = "simple return"
 sb.markdown("**3 · Choose what to test**")
-factors = msel(sb, "Market & macro factors", factor_opts, DEFAULTS.factors, "w_factors",
+factors = msel(sb, "Market & macro factors", factor_opts, list(PF.default_factors), K("w_factors"),
                format_func=lambda k: FACTOR_LABELS.get(k, k))
 firm_opts = list(FIRM_FEATURES) if has_fund else []
-firm = msel(sb, "Company fundamentals", firm_opts, DEFAULTS.firm_features, "w_firm",
+firm = msel(sb, "Company fundamentals", firm_opts, list(PF.default_firm), K("w_firm"),
                       format_func=lambda k: FIRM_FEATURES[k]["label"],
                       disabled=not has_fund,
                       help=None if has_fund else "Needs dated fundamentals: upload a fundamentals CSV.")
 with sb.expander("Advanced settings", expanded=False):
-    hac_rule = st.radio("HAC lag rule", ["fixed", "newey_west"], key="w_hac_rule",
+    hac_rule = st.radio("HAC lag rule", ["fixed", "newey_west"], key=K("w_hac_rule"),
                         format_func=lambda x: "Fixed lags" if x == "fixed" else "Newey–West plug-in",
                         help="Heteroscedasticity- and autocorrelation-consistent (Newey–West) standard errors.")
-    hac_lags = st.number_input("Fixed HAC lags (months)", 0, 24, key="w_hac_lags", **wkw("w_hac_lags", "value", DEFAULTS.hac_lags))
-    roll_window = st.number_input("Rolling window (months)", 24, 180, step=6, key="w_roll", **wkw("w_roll", "value", DEFAULTS.rolling_window))
-    min_obs = st.number_input("Minimum observations per window", 18, 180, DEFAULTS.min_obs_rolling, key="w_minobs")
-    convention = st.selectbox("Total-return convention", ["adjusted_close", "close_plus_dividends"], key="w_conv",
+    hac_lags = st.number_input("Fixed HAC lags (months)", 0, 24, key=K("w_hac_lags"), **wkw(K("w_hac_lags"), "value", DEFAULTS.hac_lags))
+    roll_window = st.number_input("Rolling window (months)", 12, 180, step=6, key=K("w_roll"), **wkw(K("w_roll"), "value", PF.rolling_window))
+    min_obs = st.number_input("Minimum observations per window", 12, 180, key=K("w_minobs"), **wkw(K("w_minobs"), "value", PF.min_obs_rolling))
+    convention = st.selectbox("Total-return convention", ["adjusted_close", "close_plus_dividends"], key=K("w_conv"),
                               help="adjusted_close: provider split+dividend-adjusted closes (dividends counted once, "
                                    "inside the adjustment). close_plus_dividends: (close + dividend)/previous close "
                                    "with split-adjusted closes.")
-    include_leases = st.checkbox("Include lease liabilities in debt", key="w_leases", **wkw("w_leases", "value", DEFAULTS.include_leases_in_debt))
+    include_leases = st.checkbox("Include lease liabilities in debt", key=K("w_leases"), **wkw(K("w_leases"), "value", DEFAULTS.include_leases_in_debt))
     small_frac = st.number_input("Small-denominator threshold (share of assets)", 0.0, 0.05,
-                                 step=0.001, **wkw("w_smallden", "value", DEFAULTS.small_denominator_frac), format="%.3f", key="w_smallden",
+                                 step=0.001, **wkw(K("w_smallden"), "value", DEFAULTS.small_denominator_frac), format="%.3f", key=K("w_smallden"),
                                  help="Earnings growth is left missing when |prior-year net income| is below this "
                                       "fraction of total assets.")
 with sb.expander("Data status & cache", expanded=False):
@@ -329,17 +350,20 @@ settings = DEFAULTS.to_dict()
 settings.update(tickers=list(tickers), benchmark=benchmark, start=str(start_m), end=str(end_m), factors=list(factors),
                 firm_features=list(firm), hac_lag_rule=hac_rule, hac_lags=int(hac_lags), rolling_window=int(roll_window),
                 min_obs_rolling=int(min_obs), return_convention=convention, include_leases_in_debt=include_leases,
-                small_denominator_frac=float(small_frac), data_mode="synthetic" if SYN else mode)
+                small_denominator_frac=float(small_frac), data_mode="synthetic" if SYN else mode, preset=preset,
+                control_symbol=CONTROL, exchange=PF.exchange, currency=PF.currency)
 
 # =========================================================================== panel
 data_key = json.dumps(data.get("provider_meta", {}), default=str) + str(len(prices)) + str(prices["session_date"].max())
 try:
-    pan = _panel(data, data_key, tuple(tickers), benchmark, start_m - 1, end_m, convention, include_leases, small_frac)
+    a_start = () if SYN else tuple((m["symbol"], m["analysis_start"]) for m in PF.universe if m.get("analysis_start"))
+    pan = _panel(data, data_key + preset, tuple(tickers), benchmark, start_m - 1, end_m, convention, include_leases,
+                 small_frac, PF.exchange, CONTROL, a_start)
 except Exception as e:
     st.error(f"Could not align the data: {e}")
     st.stop()
 panel = pan["panel"]
-pkey = data_key + str((tuple(tickers), benchmark, str(start_m), str(end_m), convention, include_leases, small_frac))
+pkey = data_key + preset + str((CONTROL, tuple(tickers), benchmark, str(start_m), str(end_m), convention, include_leases, small_frac))
 eff_end = min(end_m, pan["end_month"])
 colors = C.color_map(tickers)
 X = list(factors) + list(firm)
@@ -348,7 +372,7 @@ if "results" not in st.session_state:
 RES = st.session_state.results
 
 (t_home, t_today, t_over, t_drv, t_int, t_roll, t_fc, t_pf, t_exp) = st.tabs(
-    ["Start here", "Latest month", "Data", "What moves each stock", "Oil × debt", "Stability over time",
+    ["Start here", "Latest month", "Data", "What moves each stock", PF.interaction_label, "Stability over time",
      "Can it predict?", "Portfolio", "Export"])
 
 FITS, FIT_ERRS = (_fits(panel, pkey, tuple(tickers), tuple(X), start_m, eff_end, hac_rule, int(hac_lags))
@@ -364,10 +388,12 @@ def _sig(q):
 # =========================================================================== Start here
 with t_home:
     st.subheader("What this dashboard does")
-    st.markdown("It asks how the stocks in your watchlist have moved with **the market, oil prices, interest rates "
-                "and the Canadian dollar**, and whether **company debt and earnings** change those relationships. "
-                "It then tests whether any of this **predicts next month's returns** better than simple guesses, "
-                "and explores a low-risk **portfolio**. Everything is calculated from historical monthly data.")
+    drivers = ("**the market, oil prices, interest rates and the Canadian dollar**" if preset == "canada_energy" else
+               "**the market, NVIDIA (as an AI-cycle control), Treasury yields, market volatility and the US dollar**")
+    st.markdown(f"It asks how the stocks in your watchlist have moved with {drivers}, and whether **company "
+                "fundamentals** (debt, profitability, earnings) change those relationships. It then tests whether any "
+                "of this **predicts next month's returns** better than simple guesses, and explores a low-risk "
+                f"**portfolio**. Everything is calculated from historical monthly data. Preset: **{PF.label}**.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Data source", "Demo" if SYN else mode.split()[0], help="Synthetic demo data" if SYN else mode)
     c2.metric("Stocks", len(tickers))
@@ -380,41 +406,57 @@ with t_home:
     else:
         eff_all = R.effects_table(FITS)
         lines = []
-        if "oil" in X:
-            o = eff_all[eff_all.term == "oil"].sort_values("effect", ascending=False)
+        HEADLINE_TEXT = {"oil": "when WTI rose 10% in a month", "y10": "when the 10-year Treasury yield rose 25 bp in a month"}
+        hf = PF.headline_factor
+        if hf in X and (eff_all.term == hf).any():
+            o = eff_all[eff_all.term == hf].sort_values("effect", ascending=False)
             top, bot = o.iloc[0], o.iloc[-1]
-            lines.append(f"**Oil:** when WTI rose 10% in a month, **{top.symbol}** tended to move the most "
-                         f"({top.effect * 100:+.1f} percentage points, range {top.effect_ci_low * 100:+.1f} to "
-                         f"{top.effect_ci_high * 100:+.1f}) and **{bot.symbol}** the least ({bot.effect * 100:+.1f} pp). "
+            lines.append(f"**{FACTOR_LABELS.get(hf, hf).split(' (')[0]}:** {HEADLINE_TEXT.get(hf, R.EFFECT_SCALES[hf][1])}, "
+                         f"**{top.symbol}** had the most positive typical response ({top.effect * 100:+.1f} percentage "
+                         f"points, range {top.effect_ci_low * 100:+.1f} to {top.effect_ci_high * 100:+.1f}) and "
+                         f"**{bot.symbol}** the most negative ({bot.effect * 100:+.1f} pp, range "
+                         f"{bot.effect_ci_low * 100:+.1f} to {bot.effect_ci_high * 100:+.1f}). "
                          + (f"Both links were {_sig(top.q_value)}." if _sig(top.q_value) == _sig(bot.q_value) else
                             f"The link was {_sig(top.q_value)} for {top.symbol} and {_sig(bot.q_value)} for {bot.symbol}."))
         if "market" in X:
             m = eff_all[eff_all.term == "market"].sort_values("estimate")
             lines.append(f"**Market:** betas ranged from {m.iloc[0].estimate:.2f} ({m.iloc[0].symbol}, steadiest relative "
                          f"to the benchmark) to {m.iloc[-1].estimate:.2f} ({m.iloc[-1].symbol}). A beta of 1 means the "
-                         "stock tended to move one-for-one with the market.")
-        for f, name in (("rate", "Interest rates"), ("fx", "USD/CAD")):
-            if f in X:
-                g = eff_all[eff_all.term == f]
+                         "stock tended to move one-for-one with the market"
+                         + (", holding the control stock fixed." if "control" in X else "."))
+        if "control" in X and (eff_all.term == "control").any():
+            g = eff_all[eff_all.term == "control"].sort_values("estimate")
+            clear = g[g.q_value < 0.05]["symbol"].tolist()
+            lines.append(f"**{CONTROL} control:** beyond the general market, a 1 pp higher {CONTROL} return was associated "
+                         f"with {g.estimate.min():+.2f} to {g.estimate.max():+.2f} pp for these stocks; clear in "
+                         f"{len(clear)} of {len(g)}" + (f" ({', '.join(clear)})." if clear else ".")
+                         + " Note that the benchmark and the control move together, so their separate estimates are less precise.")
+        for f in [f for f in X if f in FACTOR_SPECS and f != hf]:
+            g = eff_all[eff_all.term == f]
+            if len(g):
                 clear = g[g.q_value < 0.05]["symbol"].tolist()
-                lines.append(f"**{name}:** a clear association in {len(clear)} of {len(g)} stocks"
-                             + (f" ({', '.join(clear)})." if clear else "."))
-        if {"oil", "debt_to_assets"} <= set(panel.columns) and "debt_to_assets" in X:
-            hits, n_ok = [], 0
-            for s in tickers:
-                d = panel[panel.symbol == s].set_index("month")
+                lines.append(f"**{FACTOR_LABELS.get(f, f).split(' (')[0]}:** a clear association in {len(clear)} of "
+                             f"{len(g)} stocks" + (f" ({', '.join(clear)})." if clear else "."))
+        ia, ib = PF.interaction
+        if ia in X and ib in X and ib in panel.columns:
+            hits_pos, hits_neg, n_ok = [], [], 0
+            for s_ in tickers:
+                d = panel[panel.symbol == s_].set_index("month")
                 d = d[(d.index >= start_m) & (d.index <= eff_end)]
                 try:
-                    ri = R.fit_interaction(d, "ret", "oil", "debt_to_assets",
-                                           [x for x in X if x not in ("oil", "debt_to_assets")], s, hac_rule, int(hac_lags))
+                    ri = R.fit_interaction(d, "ret", ia, ib, [x for x in X if x not in (ia, ib)], s_, hac_rule, int(hac_lags))
                     n_ok += 1
-                    if ri.pvalues["oil_x_debt_to_assets"] < 0.05 and ri.params["oil_x_debt_to_assets"] > 0:
-                        hits.append(s)
+                    term = f"{ia}_x_{ib}"
+                    if ri.pvalues[term] < 0.05:
+                        (hits_pos if ri.params[term] > 0 else hits_neg).append(s_)
                 except R.ModelSpecError:
                     pass
-            lines.append(f"**Oil × debt:** in {len(hits)} of {n_ok} stocks, oil sensitivity was clearly higher in "
-                         f"periods when the company carried more debt" + (f" ({', '.join(hits)})." if hits else ".")
-                         + " (Raw p < 0.05, not adjusted for multiple tests; see *Oil × debt* for details.)")
+            lines.append(f"**{PF.interaction_label}:** asks {PF.interaction_question}. A clear dependence appeared in "
+                         f"{len(hits_pos) + len(hits_neg)} of {n_ok} stocks"
+                         + (f": sensitivity rose with higher {FACTOR_LABELS.get(ib, ib).lower()} for {', '.join(hits_pos)}"
+                            if hits_pos else "")
+                         + (f"; it fell for {', '.join(hits_neg)}" if hits_neg else "") + ". "
+                         + f"(Raw p < 0.05, not adjusted for multiple tests; see *{PF.interaction_label}*.)")
         st.markdown("\n\n".join(f"- {l}" for l in lines))
         for s, e in FIT_ERRS.items():
             st.warning(e)
@@ -424,11 +466,11 @@ with t_home:
     home_portfolio = st.empty()
 
     st.subheader("How to use it")
-    st.markdown("""
+    st.markdown(f"""
 1. **Pick your data and stocks** in the left sidebar. *Synthetic* is a built-in demo with known answers. *Live* downloads real prices. *CSV import* uses your own files.
 2. **Latest month**: what explained last month's moves for each stock, plus this month so far in Live mode.
 3. **What moves each stock**: how strongly each stock has moved with each factor, with uncertainty ranges.
-4. **Oil × debt**: whether oil sensitivity depends on how indebted the company is.
+4. **{PF.interaction_label}**: {PF.interaction_question}.
 5. **Stability over time**: whether those relationships held steady or shifted.
 6. **Can it predict?**: an honest test of next-month forecasts against simple baselines.
 7. **Portfolio**: a minimum-risk mix of the stocks compared with equal weights, including trading costs.
@@ -454,7 +496,7 @@ with t_home:
 # =========================================================================== Latest month / today
 with t_today:
     st.subheader(f"What explained {eff_end}'s moves")
-    comps = [f for f in ("market", "oil", "rate", "fx") if f in X]
+    comps = [f for f in ["market", "control"] + list(FACTOR_SPECS) if f in X]
     if BETAS.empty or not comps:
         st.info("Needs at least one market/macro factor and a successful fit (see *What moves each stock*).")
     else:
@@ -465,10 +507,17 @@ with t_today:
             st.info(f"No complete returns for {eff_end}.")
         else:
             mv = []
-            if "market" in moves: mv.append(f"benchmark {pct(moves['market'], 1)}")
-            if "oil" in moves: mv.append(f"WTI {pct(math.exp(moves['oil']) - 1, 1)}")
-            if "rate" in moves: mv.append(f"policy rate {moves['rate'] * 100:+.0f} bp")
-            if "fx" in moves: mv.append(f"USD/CAD {pct(math.exp(moves['fx']) - 1, 1)}")
+            for f, v in moves.items():
+                if pd.isna(v):
+                    continue
+                if f == "market":
+                    mv.append(f"benchmark {pct(v, 1)}")
+                elif f == "control":
+                    mv.append(f"{CONTROL} {pct(v, 1)}")
+                elif FACTOR_SPECS[f].transformation == "log_change":
+                    mv.append(f"{FACTOR_LABELS.get(f, f).split(' (')[0]} {pct(math.exp(v) - 1, 1)}")
+                else:
+                    mv.append(f"{FACTOR_LABELS.get(f, f).split(' (')[0]} {v * 100:+.0f} bp")
             st.markdown("**Factor moves that month:** " + " · ".join(mv))
             st.plotly_chart(C.attribution_bar(att, comps, f"{eff_end}: return split into factor contributions", SYN),
                             width="stretch")
@@ -491,17 +540,17 @@ with t_today:
         st.info("Needs a successful model fit first.")
     else:
         @st.cache_data(ttl=900, show_spinner="Fetching latest closes…")
-        def _snapshot(syms):
+        def _snapshot(syms, preset_):
             from mfd.live import fetch_snapshot
-            return fetch_snapshot(list(syms))
+            return fetch_snapshot(list(syms), preset_)
         if st.button("Refresh latest quotes", help="Downloads once and caches for 15 minutes. Nothing refreshes automatically."):
-            st.session_state.live_snapshot = _snapshot(tuple(tickers) + (benchmark,))
+            st.session_state[K("live_snapshot")] = _snapshot(tuple(tickers) + (benchmark,) + ((CONTROL,) if CONTROL else ()), preset)
             st.session_state.live_snapshot_at = pd.Timestamp.now(tz="America/Toronto")
-        snap = st.session_state.get("live_snapshot")
+        snap = st.session_state.get(K("live_snapshot"))
         if snap is None:
             st.caption("Press **Refresh latest quotes** to load this month's moves.")
         else:
-            from mfd.live import LIVE_FACTOR_SYMBOLS, attribute, period_moves
+            from mfd.live import LIVE_PROXIES, attribute, period_moves
             snap_df, probs = snap
             for p in probs:
                 st.warning(p)
@@ -519,15 +568,17 @@ with t_today:
                 st.dataframe(tbl.style.format({"last_close": "{:.2f}", "last day": "{:+.2%}", "month to date": "{:+.2%}"}),
                              width="stretch")
                 fm = {"market": pm["period_return"].get(benchmark, np.nan)}
-                for f, (ysym, _, _) in LIVE_FACTOR_SYMBOLS.items():
-                    fm[f] = pm["period_log"].get(ysym, np.nan)
+                if CONTROL:
+                    fm["control"] = pm["period_return"].get(CONTROL, np.nan)
+                for f, (ysym, _, kind) in LIVE_PROXIES[preset].items():
+                    fm[f] = pm["period_log" if kind == "log" else "period_diff"].get(ysym, np.nan)
                 fm = {k: v for k, v in fm.items() if k in comps}
                 att_live = attribute(pm["period_return"].reindex(tickers).dropna(), BETAS, fm)
                 if len(att_live):
                     st.plotly_chart(C.attribution_bar(att_live, [c for c in comps if c in fm],
                                                       "Month to date: return split into factor contributions"), width="stretch")
-                    st.caption("Oil uses the front-month WTI future (CL=F) and USD/CAD uses CAD=X as live proxies. "
-                               "The policy rate is not moved intra-month. Applying monthly betas to a partial month is "
+                    st.caption("Live proxies: " + "; ".join(f"{f} uses {v[0]} ({v[1]})" for f, v in LIVE_PROXIES[preset].items())
+                               + ". Policy rates are not moved intra-month. Applying monthly betas to a partial month is "
                                "an approximation.")
 
 
@@ -544,7 +595,7 @@ with t_over:
     for n in data.get("notes", []) + pan.get("notes", []):
         st.info(n)
     st.markdown(f"**Analysis window:** {start_m} → {eff_end} (latest completed month with data: {pan['end_month']}). "
-                "Decision cutoff each month: 17:00 Toronto on its last TSX session.")
+                f"Decision cutoff each month: 17:00 Eastern time on its last {PF.exchange} session. Currency: {PF.currency}.")
     c1, c2 = st.columns([3, 2])
     with c1:
         mr = pan["monthly_returns"]
@@ -578,6 +629,9 @@ with t_over:
                 st.markdown(f"**{FACTOR_SPECS[k].label}** — {FACTOR_SPECS[k].description}")
             elif k in FIRM_FEATURES:
                 st.markdown(f"**{FIRM_FEATURES[k]['label']}** — {FIRM_FEATURES[k]['definition']}")
+            elif k == "control":
+                st.markdown(f"**{FACTOR_LABELS['control']}** — monthly total return of {CONTROL}. Included as a control "
+                            "factor: its coefficient measures co-movement with this AI leader beyond the benchmark.")
             elif k == "market":
                 st.markdown(f"**Benchmark total return** — monthly simple total return of {benchmark}, used as a "
                             "contemporaneous control in descriptive models and lagged in forecasts.")
@@ -626,7 +680,7 @@ with t_drv:
             st.caption("q-values: Benjamini–Hochberg false-discovery-rate adjustment over the stated family. "
                        "Intercepts are excluded from the family. Confidence intervals use HAC standard errors with "
                        "the t distribution (residual df).")
-            sym = sel(st, "Stock detail", list(fits), list(fits)[0], "w_detail")
+            sym = sel(st, "Stock detail", list(fits), list(fits)[0], K("w_detail"))
             r = fits[sym]
             fit_cols = st.columns(5)
             fit_cols[0].metric("Months used", r.nobs, help=f"{r.start} → {r.end}; {r.dropped_rows} rows dropped for missing values")
@@ -684,14 +738,14 @@ with t_int:
         st.info("Interactions need at least one factor and one moderator (e.g. debt/assets from a fundamentals CSV).")
     else:
         c1, c2, c3 = st.columns(3)
-        a = sel(c1, "Factor (a)", a_opts, "oil" if "oil" in a_opts else a_opts[0], "w_ia",
+        a = sel(c1, "Factor (a)", a_opts, PF.interaction[0] if PF.interaction[0] in a_opts else a_opts[0], K("w_ia"),
                 format_func=lambda k: FACTOR_LABELS.get(k, k))
         bo = [x for x in b_opts if x != a]
-        b = sel(c2, "Moderator (b)", bo, "debt_to_assets" if "debt_to_assets" in bo else bo[0], "w_ib",
+        b = sel(c2, "Moderator (b)", bo, PF.interaction[1] if PF.interaction[1] in bo else bo[0], K("w_ib"),
                 format_func=lambda k: FACTOR_LABELS.get(k, k))
-        isym = sel(c3, "Stock", tickers, tickers[0], "w_isym")
+        isym = sel(c3, "Stock", tickers, tickers[0], K("w_isym"))
         ctrl_opts = [x for x in X if x not in (a, b)]
-        controls = msel(st, "Controls", ctrl_opts, ctrl_opts, "w_ictrl", format_func=lambda k: FACTOR_LABELS.get(k, k))
+        controls = msel(st, "Controls", ctrl_opts, ctrl_opts, K("w_ictrl"), format_func=lambda k: FACTOR_LABELS.get(k, k))
         rows, ires = [], {}
         for s in tickers:
             d = panel[panel["symbol"] == s].set_index("month")
@@ -729,9 +783,10 @@ with t_int:
             m3.metric("p (interaction)", f"{r.pvalues[inter]:.4f}")
             m4.metric("Months", r.nobs, help=f"{r.start} → {r.end}")
             truth_line = None
-            if SYN and data.get("truth") is not None and a == "oil" and b == "debt_to_assets":
-                t = data["truth"].set_index("symbol").loc[isym]
-                truth_line = (t["oil"], t["oil_x_debt"], t["debt_center"])
+            tr_ = data.get("truth") if SYN else None
+            if tr_ is not None and f"{a}_x_{b}" in tr_.columns and isym in set(tr_["symbol"]):
+                t = tr_.set_index("symbol").loc[isym]
+                truth_line = (t[a], t[f"{a}_x_{b}"], t["center"])
             st.plotly_chart(C.interaction_curve(cs, b, FACTOR_LABELS.get(a, a), scale, slab, SYN, truth_line), width="stretch")
             st.caption(f"Hollow markers: grid points with fewer than max(5, 5% of months) observations within ±0.5 SD of "
                        f"{b}, or outside the observed range ({obs_b.min():.3f}–{obs_b.max():.3f}). Treat those parts "
@@ -741,12 +796,12 @@ with t_int:
             st.markdown("**Scenario (fitted conditional mean within the observed range)**")
             sc1, sc2 = st.columns(2)
             if FACTOR_SPECS.get(a) and FACTOR_SPECS[a].transformation == "log_change":
-                pct_move = sc1.number_input(f"Assumed {a} move this month (%)", -50.0, 100.0, 10.0, step=1.0, key="w_scen_a")
+                pct_move = sc1.number_input(f"Assumed {a} move this month (%)", -50.0, 100.0, 10.0, step=1.0, key=K("w_scen_a"))
                 a_val = math.log(1 + pct_move / 100)
                 sc1.caption(f"Log-change model: a {pct_move:+.1f}% move enters as log(1{pct_move / 100:+.3f}) = {a_val:.4f}.")
             else:
-                a_val = sc1.number_input(f"Assumed {a} value", value=float(scale or 0.01), format="%.4f", key="w_scen_a2")
-            b_val = sc2.number_input(f"Assumed {b}", value=float(round(r.centers[b], 3)), format="%.3f", key="w_scen_b")
+                a_val = sc1.number_input(f"Assumed {a} value", value=float(scale or 0.01), format="%.4f", key=K("w_scen_a2"))
+            b_val = sc2.number_input(f"Assumed {b}", value=float(round(r.centers[b], 3)), format="%.3f", key=K("w_scen_b"))
             vals = {c: float(r.data[c].mean()) for c in controls}
             vals.update({a: a_val, b + "_c": b_val - r.centers[b], inter: a_val * (b_val - r.centers[b])})
             sm = R.scenario_mean(r, vals)
@@ -773,7 +828,7 @@ with t_roll:
         st.warning("Select factors in the sidebar.")
     else:
         rc1, rc2, rc3 = st.columns(3)
-        rsyms = msel(rc1, "Stocks", tickers, tickers[: min(4, len(tickers))], "w_rsyms")
+        rsyms = msel(rc1, "Stocks", tickers, tickers[: min(4, len(tickers))], K("w_rsyms"))
         use_int = rc2.checkbox("Add interaction (factor × moderator)", key="w_rint",
                                disabled=not any(f in X for f in firm_opts))
         standardized = rc3.radio("Scale", ["Raw units", "Standardized (shared full-period SDs)"], key="w_rscale") != "Raw units"
@@ -781,9 +836,10 @@ with t_roll:
         if use_int:
             ic1, ic2, ic3 = st.columns(3)
             ra_opts, rb_opts = [f for f in X if f in factor_opts], [f for f in X if f in firm_opts]
-            ra = sel(ic1, "Factor", ra_opts, "oil" if "oil" in ra_opts else ra_opts[0], "w_ra")
-            rb = sel(ic2, "Moderator", rb_opts, "debt_to_assets" if "debt_to_assets" in rb_opts else rb_opts[0], "w_rb")
-            slope_at = ic3.number_input(f"Report {ra} sensitivity at fixed {rb} =", value=0.30, format="%.3f", key="w_rslope")
+            ra = sel(ic1, "Factor", ra_opts, PF.interaction[0] if PF.interaction[0] in ra_opts else ra_opts[0], K("w_ra"))
+            rb = sel(ic2, "Moderator", rb_opts, PF.interaction[1] if PF.interaction[1] in rb_opts else rb_opts[0], K("w_rb"))
+            slope_at = ic3.number_input(f"Report {ra} sensitivity at fixed {rb} =", format="%.3f", key=K("w_rslope"),
+                                        **wkw(K("w_rslope"), "value", 0.30 if rb == "debt_to_assets" else 0.0))
             interaction = (ra, rb)
         roll, rsk = _rolling(panel, pkey, tuple(rsyms), tuple(X), int(roll_window), int(min_obs), hac_rule,
                              int(hac_lags), interaction, slope_at, start_m, eff_end)
@@ -792,7 +848,7 @@ with t_roll:
         else:
             RES["rolling"] = roll
             terms_all = list(dict.fromkeys(roll["term"]))
-            terms = msel(st, "Terms", terms_all, [t for t in terms_all if t.startswith("slope_")] or terms_all[:3], "w_rterms")
+            terms = msel(st, "Terms", terms_all, [t for t in terms_all if t.startswith("slope_")] or terms_all[:3], K("w_rterms"))
             if standardized:
                 full = panel[(panel["month"] >= start_m) & (panel["month"] <= eff_end)]
                 sds = full.groupby("symbol")[[c for c in X if c in full] + ["ret"]].std()
@@ -825,18 +881,20 @@ with t_fc:
     lag_labels = {"lag_own": "own return, month t", "lag_market": "benchmark return, month t",
                   **{f"lag_{k}": f"{v.label} — value known at cutoff t" for k, v in FACTOR_SPECS.items()},
                   **{f"lag_{k}": f"{v['label']} — latest report released by cutoff t" for k, v in FIRM_FEATURES.items()}}
-    fdef = [c for c in ["lag_own", "lag_market", "lag_oil", "lag_rate", "lag_fx", "lag_debt_to_assets",
-                        "lag_earnings_growth"] if c in lag_opts]
+    fdef = [c for c in ["lag_own", "lag_market", "lag_control"] + [f"lag_{f}" for f in PF.macro_factors]
+            + [f"lag_{f}" for f in PF.default_firm] if c in lag_opts]
+    lag_labels["lag_control"] = f"{CONTROL} return, month t" if CONTROL else "control"
     fc1, fc2 = st.columns([3, 2])
-    feats = msel(fc1, "Predictors (all known at the decision cutoff)", lag_opts, fdef, "w_ffeats",
+    feats = msel(fc1, "Predictors (all known at the decision cutoff)", lag_opts, fdef, K("w_ffeats"),
                  format_func=lambda c: lag_labels.get(c, c))
-    fint = fc2.checkbox("Add lag_oil × lag_debt_to_assets (centered on training mean)", key="w_fint",
-                        disabled=not ({"lag_oil", "lag_debt_to_assets"} <= set(feats)))
+    la, lb = f"lag_{PF.interaction[0]}", f"lag_{PF.interaction[1]}"
+    fint = fc2.checkbox(f"Add {la} × {lb} (centered on training mean)", key=K("w_fint"),
+                        disabled=not ({la, lb} <= set(feats)))
     with st.expander("Training and evaluation settings", expanded=False):
         e1, e2, e3, e4 = st.columns(4)
         fwin = e1.radio("Training window", ["expanding", "trailing"], key="w_fwin")
-        ftrail = e1.number_input("Trailing length (months)", 24, 240, DEFAULTS.forecast_trailing, key="w_ftrail")
-        fmin = e2.number_input("Initial training months", 24, 180, DEFAULTS.forecast_min_train, key="w_fmin")
+        ftrail = e1.number_input("Trailing length (months)", 24, 240, DEFAULTS.forecast_trailing, key=K("w_ftrail"))
+        fmin = e2.number_input("Initial training months", 12, 180, key=K("w_fmin"), **wkw(K("w_fmin"), "value", PF.forecast_min_train))
         fimp = e2.selectbox("Missing predictors", ["drop", "train_median"], key="w_fimp",
                             format_func=lambda x: "drop row (default)" if x == "drop" else "impute training-window median")
         alph = e3.text_input("Ridge alphas", ", ".join(str(a) for a in DEFAULTS.ridge_alphas), key="w_falpha")
@@ -855,7 +913,7 @@ with t_fc:
         fpanel = panel[(panel["month"] >= start_m - 1) & (panel["month"] <= eff_end)]
         run_id = uuid.uuid5(uuid.NAMESPACE_URL, pkey + str((feats, fint, fwin, ftrail, fmin, fimp, alphas, fcv, fret))).hex[:12]
         fc, fsk = _forecasts(fpanel, pkey, tuple(tickers), tuple(feats), int(fmin), fwin, int(ftrail), alphas, int(fcv),
-                             fimp, ("lag_oil", "lag_debt_to_assets") if fint else None, int(fret), float(fpi), run_id)
+                             fimp, (la, lb) if fint else None, int(fret), float(fpi), run_id)
         if fc.empty:
             st.error(f"No forecasts could be made: need ≥ {fmin} complete training months before the first decision. "
                      "Reduce the initial training window, drop sparse predictors, or extend the date range.")
@@ -899,7 +957,7 @@ with t_fc:
                           format_func=lambda m: F.MODEL_LABELS[m])
             st.plotly_chart(C.cumulative_sse_gap(seg, models, synthetic=SYN), width="stretch")
             g1, g2 = st.columns(2)
-            fsym = sel(g1, "Stock", tickers, tickers[0], "w_fsym")
+            fsym = sel(g1, "Stock", tickers, tickers[0], K("w_fsym"))
             pim = sel(g2, "Prediction interval for", ["none"] + models, "none", "w_fpim")
             st.plotly_chart(C.forecast_history(seg, fsym, models, SYN, None if pim == "none" else pim), width="stretch")
             h1, h2 = st.columns(2)
@@ -935,7 +993,7 @@ with t_pf:
                 'eligible universe. Risk numbers are estimates from these fitted inputs.</p>', unsafe_allow_html=True)
     pc1, pc2, pc3 = st.columns(3)
     cap = pc1.slider("Max weight per stock", 0.05, 1.0, DEFAULTS.max_weight, 0.05, key="w_cap")
-    look = pc2.number_input("Covariance lookback (months)", 24, 180, DEFAULTS.cov_lookback, key="w_look")
+    look = pc2.number_input("Covariance lookback (months)", 12, 180, key=K("w_look"), **wkw(K("w_look"), "value", PF.cov_lookback))
     mw = pan["monthly_returns"].pivot(index="month", columns="symbol", values="ret")
     win = mw.loc[(mw.index > eff_end - int(look)) & (mw.index <= eff_end), [s for s in tickers if s in mw]]
     dropped = [s for s in win.columns if win[s].isna().any()]
@@ -974,8 +1032,9 @@ with t_pf:
     fee = b2.number_input("Fees (bps per traded $)", 0.0, 100.0, DEFAULTS.fee_bps, key="w_fee")
     slip = b3.number_input("Slippage (bps per traded $)", 0.0, 200.0, DEFAULTS.slippage_bps, key="w_slip")
     ci = b4.checkbox("Charge cost on initial purchase", True, key="w_ci")
-    rf_mode = b5.selectbox("Risk-free (for Sharpe)", ["none", "constant", "BoC policy rate (proxy)"], key="w_rf")
-    rf_const = st.number_input("Constant CAD risk-free rate (annual %)", 0.0, 10.0, 2.0, key="w_rfc") if rf_mode == "constant" else None
+    rf_mode = b5.selectbox("Risk-free (for Sharpe)", ["none", "constant", f"{PF.rf_label} (proxy)"], key=K("w_rf"))
+    rf_const = (st.number_input(f"Constant {PF.currency} risk-free rate (annual %)", 0.0, 10.0, 2.0, key="w_rfc")
+                if rf_mode == "constant" else None)
     try:
         res, wh, bmsg = _backtest(pan, pkey + str(start_m), tuple(tickers), benchmark, int(look), float(cap), float(fee),
                                   float(slip), int(every), bool(ci))
@@ -983,11 +1042,12 @@ with t_pf:
         rf, rf_label = None, "none"
         if rf_mode == "constant":
             rf = pd.Series((1 + rf_const / 100) ** (1 / 12) - 1, index=pd.period_range(start_m, eff_end, freq="M"))
-            rf_label = f"constant {rf_const:.2f}% p.a. (CAD), compounded monthly"
-        elif rf_mode.startswith("BoC") and len(pan["macro_pit"]) and "rate" in pan["macro_pit"]["factor"].unique():
-            lv = pan["macro_pit"][pan["macro_pit"]["factor"] == "rate"].set_index("month")["level"]
+            rf_label = f"constant {rf_const:.2f}% p.a. ({PF.currency}), compounded monthly"
+        elif rf_mode.endswith("(proxy)") and len(pan["macro_pit"]) and PF.rf_factor in pan["macro_pit"]["factor"].unique():
+            lv = pan["macro_pit"][pan["macro_pit"]["factor"] == PF.rf_factor].set_index("month")["level"]
             rf = lv / 100 / 12
-            rf_label = "BoC policy-rate level at the decision cutoff ÷ 12 (approximate CAD cash return; not a T-bill series)"
+            rf_label = (f"{PF.rf_label} level at the decision cutoff ÷ 12 (approximate {PF.currency} cash return; "
+                        "not a T-bill series)")
         summ = P.performance_summary(res, rf, rf_label)
         _s = summ.set_index("strategy")
         if {"min_vol", "equal_weight"} <= set(_s.index):
@@ -1004,7 +1064,7 @@ with t_pf:
         with g2:
             st.plotly_chart(C.drawdown_plot(res, SYN), width="stretch")
         st.dataframe(summ, hide_index=True, width="stretch")
-        st.caption("Execution: close of the first TSX session after each month-end cutoff; returns run execution-to-"
+        st.caption(f"Execution: close of the first {PF.exchange} session after each month-end cutoff; returns run execution-to-"
                    "execution from the total-return index; weights drift between rebalances. Traded notional = "
                    "Σ|target − drifted weight|; each traded dollar pays fees + slippage once. Half-turnover = traded "
                    "notional ÷ 2 (equal to one-sided turnover when the portfolio stays fully invested). Gross results "
@@ -1012,8 +1072,12 @@ with t_pf:
         with st.expander("Rebalance log and weights"):
             st.dataframe(res, hide_index=True, width="stretch")
             st.dataframe(wh, hide_index=True, width="stretch")
-        for m in bmsg[:10]:
-            st.warning(m)
+        if bmsg:
+            st.warning(f"{len(bmsg)} scheduled rebalance(s) were skipped, mostly early on when too few stocks had enough "
+                       f"history for the {look}-month lookback (first: {bmsg[0].split(':')[0]}, last: "
+                       f"{bmsg[-1].split(':')[0]}). The evaluation starts at the first feasible rebalance.")
+            with st.expander("Skipped rebalances"):
+                st.write("\n".join(bmsg))
     except P.PortfolioInfeasible as e:
         st.error(f"Backtest: {e}")
 

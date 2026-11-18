@@ -29,6 +29,12 @@ EFFECT_SCALES = {
     "earnings_growth": (0.10, "+10 pp YoY net-income growth"),
     "earnings_change_scaled": (0.01, "+1% of assets net-income change"),
     "oil_x_debt": (None, "see conditional slope"),
+    "y10": (0.25, "+25 bp 10-year Treasury yield"),
+    "ffr": (0.25, "+25 bp fed funds rate"),
+    "vix": (math.log(1.20), "+20% VIX (log 1.20)"),
+    "usd": (math.log(1.02), "+2% broad US dollar (log 1.02)"),
+    "control": (0.01, "+1 pp control-stock return"),
+    "profitability": (0.01, "+1 pp quarterly return on assets"),
 }
 MIN_RESID_DF = 10
 
